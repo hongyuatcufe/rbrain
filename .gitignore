@@ -1,0 +1,28 @@
+# Build artifacts
+/target/
+
+# Runtime data directories (project-local brain data — never commit)
+.rbrain/
+
+# SQLite databases and vector indices (runtime data)
+*.db
+*.db-shm
+*.db-wal
+*.usearch
+
+# Config files that may contain API keys
+config.toml
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Editor / tool-specific
+.idea/
+.vscode/
+.sisyphus/
+*.swp
+*.swo
+
+# Cargo — Cargo.lock is committed (binary application, reproducible builds)

@@ -1,0 +1,108 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rbrain-core",
+    "crates/rbrain-db",
+    "crates/rbrain-search",
+    "crates/rbrain-llm",
+    "crates/rbrain-engine",
+    "crates/rbrain-cli",
+    "crates/rbrain-mcp",
+    "crates/rbrain-worker",
+    "examples",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Core types
+rbrain-core = { path = "crates/rbrain-core" }
+rbrain-db = { path = "crates/rbrain-db" }
+rbrain-search = { path = "crates/rbrain-search" }
+rbrain-llm = { path = "crates/rbrain-llm" }
+rbrain-engine = { path = "crates/rbrain-engine" }
+rbrain-worker = { path = "crates/rbrain-worker" }
+rbrain-mcp = { path = "crates/rbrain-mcp" }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# SQLite
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "json"] }
+
+# Search (YOUNG - PIN EXACT)
+tantivy = "=0.26.1"
+lindera-tantivy = "=2.0.0"
+# lindera 2.x (same major as lindera-tantivy 2.0.0); 3.x crates are incompatible
+lindera = { version = "=2.3.4", features = ["embed-ipadic", "embed-cc-cedict", "embed-ko-dic"] }
+
+# Vector search (YOUNG - PIN EXACT)
+usearch = "=2.25.2"
+
+# Embeddings + LLM (HTTP via reqwest)
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# MCP (YOUNG - PIN EXACT)
+rmcp = { version = "=1.7.0", features = ["transport-io", "server", "macros"] }
+
+# Markdown
+pulldown-cmark = "0.12"
+gray_matter = "0.3.2"
+unicode-normalization = "0.1"
+
+# Chinese normalization (pure Rust, no system OpenCC needed)
+ferrous-opencc = "0.4"
+
+# Language detection
+whatlang = "0.16"
+
+# Chunking
+text-splitter = { version = "0.30.1", features = ["markdown"] }
+
+# Git
+gix = "0.72"
+
+# HTTP
+axum = { version = "0.8", features = ["macros"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Config
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# Misc
+strsim = "0.11"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+futures = "0.3"
+governor = "0.8"
+walkdir = "2"
+regex = "1"
+
+# Dev
+tempfile = "3"
+wiremock = "0.6"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"

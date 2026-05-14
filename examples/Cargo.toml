@@ -1,0 +1,14 @@
+[package]
+name = "chunker-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rbrain-core = { path = "../crates/rbrain-core" }
+rbrain-search = { path = "../crates/rbrain-search" }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "chunker"
+path = "chunker.rs"

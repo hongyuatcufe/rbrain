@@ -1,0 +1,20 @@
+[package]
+name = "rbrain-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+figment = { workspace = true }
+home = "0.5"
+async-trait = { workspace = true }
+gray_matter = { workspace = true }
+unicode-normalization = "0.1"
+
+[lints]
+workspace = true

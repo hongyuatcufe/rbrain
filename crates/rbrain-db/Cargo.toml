@@ -1,0 +1,16 @@
+[package]
+name = "rbrain-db"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rbrain-core = { workspace = true }
+sqlx = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

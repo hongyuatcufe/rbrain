@@ -1,0 +1,24 @@
+[package]
+name = "rbrain-worker"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rbrain-core = { workspace = true }
+rbrain-engine = { workspace = true }
+rbrain-db = { workspace = true }
+rbrain-search = { workspace = true }
+rbrain-llm = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+governor = { workspace = true }
+
+sqlx = { workspace = true }
+
+[lints]
+workspace = true

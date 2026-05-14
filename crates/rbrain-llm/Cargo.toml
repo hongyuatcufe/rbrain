@@ -1,0 +1,17 @@
+[package]
+name = "rbrain-llm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rbrain-core = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

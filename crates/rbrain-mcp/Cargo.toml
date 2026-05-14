@@ -1,0 +1,21 @@
+[package]
+name = "rbrain-mcp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rbrain-core = { workspace = true }
+rbrain-engine = { workspace = true }
+rmcp = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+anyhow = { workspace = true }
+whatlang = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "rbrain-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rbrain"
+path = "src/main.rs"
+
+[dependencies]
+rbrain-core = { workspace = true }
+rbrain-engine = { workspace = true }
+rbrain-db = { workspace = true }
+rbrain-worker = { workspace = true }
+rbrain-mcp = { workspace = true }
+rbrain-search = { workspace = true }
+rbrain-llm = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sqlx = { workspace = true }
+chrono = { workspace = true }
+whatlang = { workspace = true }
+
+[lints]
+workspace = true
