@@ -1062,9 +1062,33 @@ impl Engine {
         Ok(links)
     }
 
+    /// List outgoing links from a page (with type and evidence context).
+    pub async fn outlinks(&self, slug: &str) -> Result<Vec<LinkRef>> {
+        let normalized = MarkdownParser::normalize_slug(slug);
+
+        let rows = sqlx::query(
+            "SELECT target_slug, edge_type, context FROM links WHERE source_slug = ?1 ORDER BY edge_type, target_slug",
+        )
+        .bind(&normalized)
+        .fetch_all(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        let mut links = Vec::new();
+        for row in rows {
+            links.push(LinkRef {
+                target_slug: row.get("target_slug"),
+                edge_type: row.get("edge_type"),
+                context: row.get("context"),
+            });
+        }
+
+        Ok(links)
+    }
+
     /// Add an explicit typed link between two pages (does not require [[wikilink]] syntax).
-    /// Edge type defaults to "related" if not specified.
-    /// Valid types: evidence, related, person, period, supports, contrasts, develops, mentions, references
+    /// If a link of the same (source, target, type) already exists and new context is provided,
+    /// the context is appended rather than replaced — so multiple chunk passages accumulate.
     pub async fn add_link(
         &self,
         source_slug: &str,
@@ -1074,14 +1098,34 @@ impl Engine {
     ) -> Result<()> {
         let source = MarkdownParser::normalize_slug(source_slug);
         let target = MarkdownParser::normalize_slug(target_slug);
-        sqlx::query(
-            "INSERT OR REPLACE INTO links (source_slug, target_slug, edge_type, context, created_at) \
-             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+
+        // Check if a link already exists
+        let existing_context: Option<String> = sqlx::query_scalar(
+            "SELECT context FROM links WHERE source_slug = ?1 AND target_slug = ?2 AND edge_type = ?3"
         )
         .bind(&source)
         .bind(&target)
         .bind(edge_type)
-        .bind(context)
+        .fetch_optional(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+        .flatten();
+
+        let merged_context = match (existing_context, context) {
+            (Some(existing), Some(new)) => Some(format!("{}\n\n---\n\n{}", existing, new)),
+            (Some(existing), None) => Some(existing),
+            (None, new) => new.map(|s| s.to_string()),
+        };
+
+        sqlx::query(
+            "INSERT INTO links (source_slug, target_slug, edge_type, context, created_at) \
+             VALUES (?1, ?2, ?3, ?4, datetime('now')) \
+             ON CONFLICT(source_slug, target_slug, edge_type) DO UPDATE SET context = ?4",
+        )
+        .bind(&source)
+        .bind(&target)
+        .bind(edge_type)
+        .bind(merged_context.as_deref())
         .execute(&self.inner.db)
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -1131,7 +1175,7 @@ impl Engine {
     }
 
     /// Prepend a dated entry to a page's timeline section.
-    /// Format: `- YYYY-MM-DD: <text> [Source: <source>]`
+    /// Direct SQL UPDATE — does NOT touch the links table, preserving explicit graph links.
     pub async fn add_timeline_entry(
         &self,
         slug: &str,
@@ -1139,38 +1183,85 @@ impl Engine {
         text: &str,
         source: Option<&str>,
     ) -> Result<()> {
-        let mut page = self.get_page(slug).await?;
+        let normalized = MarkdownParser::normalize_slug(slug);
+        let page = self.get_page(&normalized).await?;
         let entry = if let Some(src) = source {
             format!("- {}: {} [Source: {}]", date, text, src)
         } else {
             format!("- {}: {}", date, text)
         };
-        // Prepend (most-recent-first)
-        page.timeline = if page.timeline.trim().is_empty() {
+        let new_timeline = if page.timeline.trim().is_empty() {
             entry
         } else {
             format!("{}\n{}", entry, page.timeline)
         };
-        self.put_page(page).await
+
+        sqlx::query(
+            "UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2"
+        )
+        .bind(&new_timeline)
+        .bind(&normalized)
+        .execute(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        // Mirror to filesystem
+        let repo_path = self.inner.config.repo_dir.join(format!("{}.md", normalized));
+        if repo_path.exists() {
+            let canonical = MarkdownParser::to_canonical(&page.frontmatter, &page.compiled_truth, &new_timeline);
+            std::fs::write(&repo_path, &canonical)?;
+            let new_hash = MarkdownParser::content_hash(&canonical);
+            sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
+                .bind(&new_hash)
+                .bind(&normalized)
+                .execute(&self.inner.db)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        }
+        Ok(())
     }
 
     /// Append a short interpretive take to a page's timeline section.
-    /// Format: `- [take/<kind>] YYYY-MM-DD: <content>`
+    /// Direct SQL UPDATE — does NOT touch the links table, preserving explicit graph links.
     pub async fn add_take(
         &self,
         slug: &str,
         content: &str,
         kind: &str,
     ) -> Result<()> {
-        let mut page = self.get_page(slug).await?;
+        let normalized = MarkdownParser::normalize_slug(slug);
+        let page = self.get_page(&normalized).await?;
         let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let entry = format!("- [take/{}] {}: {}", kind, date, content);
-        page.timeline = if page.timeline.trim().is_empty() {
+        let new_timeline = if page.timeline.trim().is_empty() {
             entry
         } else {
             format!("{}\n{}", page.timeline, entry)
         };
-        self.put_page(page).await
+
+        sqlx::query(
+            "UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2"
+        )
+        .bind(&new_timeline)
+        .bind(&normalized)
+        .execute(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        // Mirror to filesystem
+        let repo_path = self.inner.config.repo_dir.join(format!("{}.md", normalized));
+        if repo_path.exists() {
+            let canonical = MarkdownParser::to_canonical(&page.frontmatter, &page.compiled_truth, &new_timeline);
+            std::fs::write(&repo_path, &canonical)?;
+            let new_hash = MarkdownParser::content_hash(&canonical);
+            sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
+                .bind(&new_hash)
+                .bind(&normalized)
+                .execute(&self.inner.db)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        }
+        Ok(())
     }
 
     /// Deep-reasoning synthesis: search context, then prompt LLM to reason through
@@ -1508,12 +1599,204 @@ impl Engine {
         deepseek.chat(system, &user).await
     }
 
+    /// Add a tag to a page (no-op if already present).
+    pub async fn add_tag(&self, slug: &str, tag: &str) -> Result<()> {
+        let mut page = self.get_page(slug).await?;
+        if !page.tags.contains(&tag.to_string()) {
+            page.tags.push(tag.to_string());
+            let tags_json = serde_json::to_string(&page.tags)?;
+            sqlx::query("UPDATE pages SET tags = ?1, updated_at = datetime('now') WHERE slug = ?2")
+                .bind(&tags_json)
+                .bind(&page.slug)
+                .execute(&self.inner.db)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+            let repo_path = self.inner.config.repo_dir.join(format!("{}.md", page.slug));
+            if repo_path.exists() {
+                let content = std::fs::read_to_string(&repo_path)?;
+                let updated = update_frontmatter_tags(&content, &page.tags);
+                std::fs::write(&repo_path, updated)?;
+                let new_hash = MarkdownParser::content_hash(&std::fs::read_to_string(&repo_path)?);
+                sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
+                    .bind(&new_hash)
+                    .bind(&page.slug)
+                    .execute(&self.inner.db)
+                    .await
+                    .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove a tag from a page (no-op if not present).
+    pub async fn remove_tag(&self, slug: &str, tag: &str) -> Result<()> {
+        let mut page = self.get_page(slug).await?;
+        let before = page.tags.len();
+        page.tags.retain(|t| t != tag);
+        if page.tags.len() != before {
+            let tags_json = serde_json::to_string(&page.tags)?;
+            sqlx::query("UPDATE pages SET tags = ?1, updated_at = datetime('now') WHERE slug = ?2")
+                .bind(&tags_json)
+                .bind(&page.slug)
+                .execute(&self.inner.db)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+            let repo_path = self.inner.config.repo_dir.join(format!("{}.md", page.slug));
+            if repo_path.exists() {
+                let content = std::fs::read_to_string(&repo_path)?;
+                let updated = update_frontmatter_tags(&content, &page.tags);
+                std::fs::write(&repo_path, updated)?;
+                let new_hash = MarkdownParser::content_hash(&std::fs::read_to_string(&repo_path)?);
+                sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
+                    .bind(&new_hash)
+                    .bind(&page.slug)
+                    .execute(&self.inner.db)
+                    .await
+                    .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// List pages that have no embedded chunks (never embedded, or all chunks stale).
+    pub async fn list_stale_pages(&self) -> Result<Vec<Page>> {
+        let stale_slugs: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT page_slug FROM chunks WHERE has_embedding = 0 OR indexed_in_vectors = 0
+             UNION
+             SELECT slug FROM pages WHERE slug NOT IN (SELECT DISTINCT page_slug FROM chunks)"
+        )
+        .fetch_all(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        let mut pages = Vec::new();
+        for slug in stale_slugs {
+            if let Ok(page) = self.get_page(&slug).await {
+                pages.push(page);
+            }
+        }
+        Ok(pages)
+    }
+
+    /// Lint the knowledge base: return (warning_type, slug, message) tuples.
+    pub async fn lint(&self) -> Result<Vec<(String, String, String)>> {
+        let mut warnings: Vec<(String, String, String)> = Vec::new();
+
+        // Pages with no/empty title
+        let rows = sqlx::query("SELECT slug, title FROM pages WHERE title = '' OR title IS NULL")
+            .fetch_all(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        for row in rows {
+            warnings.push(("WARN".into(), row.get::<String, _>("slug"), "missing title".into()));
+        }
+
+        // Pages with no embedded chunks
+        let unembedded: Vec<String> = sqlx::query_scalar(
+            "SELECT slug FROM pages WHERE slug NOT IN (SELECT DISTINCT page_slug FROM chunks WHERE has_embedding = 1)"
+        )
+        .fetch_all(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        for slug in unembedded {
+            warnings.push(("WARN".into(), slug, "not embedded (run: rbrain embed --stale)".into()));
+        }
+
+        // Orphan pages (no incoming links) — skip for small brains (<= 5 pages)
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pages")
+            .fetch_one(&self.inner.db)
+            .await
+            .unwrap_or(0);
+        if total > 5 {
+            let orphans = self.orphan_pages().await?;
+            for slug in orphans {
+                warnings.push(("INFO".into(), slug, "orphan page — no incoming links".into()));
+            }
+        }
+
+        // Broken links (target page does not exist)
+        let broken: Vec<(String, String)> = sqlx::query_as(
+            "SELECT source_slug, target_slug FROM links \
+             WHERE target_slug NOT IN (SELECT slug FROM pages)"
+        )
+        .fetch_all(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        for (src, tgt) in broken {
+            warnings.push(("WARN".into(), src, format!("broken link → {}", tgt)));
+        }
+
+        Ok(warnings)
+    }
+
+    /// Export all pages to a directory as .md files (json=true → .json files).
+    pub async fn export_pages(&self, dir: &std::path::Path, json: bool) -> Result<usize> {
+        std::fs::create_dir_all(dir)?;
+        let pages = self.list_pages(None, None).await?;
+        let count = pages.len();
+        for page in &pages {
+            if json {
+                let links = self.backlinks(&page.slug).await?;
+                let data = serde_json::json!({
+                    "slug": page.slug,
+                    "type": page.page_type,
+                    "title": page.title,
+                    "tags": page.tags,
+                    "language": page.language.as_ref().map(|l| l.to_string()),
+                    "compiled_truth": page.compiled_truth,
+                    "timeline": page.timeline,
+                    "backlinks": links.iter().map(|l| serde_json::json!({
+                        "from": l.target_slug,
+                        "type": l.edge_type,
+                        "context": l.context,
+                    })).collect::<Vec<_>>(),
+                });
+                let path = dir.join(format!("{}.json", page.slug.replace('/', "__")));
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(path, serde_json::to_string_pretty(&data)?)?;
+            } else {
+                let path = dir.join(format!("{}.md", page.slug.replace('/', "__")));
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut md = format!("# {}\n\n{}", page.title, page.compiled_truth);
+                if !page.timeline.trim().is_empty() {
+                    md.push_str(&format!("\n\n---\n\n{}", page.timeline));
+                }
+                std::fs::write(path, md)?;
+            }
+        }
+        Ok(count)
+    }
+
     pub fn get_db(&self) -> &SqlitePool {
         &self.inner.db
     }
 
     pub fn get_config(&self) -> &Config {
         &self.inner.config
+    }
+}
+
+/// Rewrite the `tags:` line in a markdown file's YAML frontmatter.
+fn update_frontmatter_tags(content: &str, tags: &[String]) -> String {
+    let tags_yaml = if tags.is_empty() {
+        "tags: []".to_string()
+    } else {
+        let items = tags.iter().map(|t| format!("  - {}", t)).collect::<Vec<_>>().join("\n");
+        format!("tags:\n{}", items)
+    };
+
+    // Replace existing tags line(s)
+    let re = regex::Regex::new(r"(?m)^tags:.*(\n  - .*)*").unwrap();
+    if re.is_match(content) {
+        re.replace(content, tags_yaml.as_str()).to_string()
+    } else {
+        content.to_string()
     }
 }
 

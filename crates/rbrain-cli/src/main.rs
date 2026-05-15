@@ -61,13 +61,18 @@ enum Commands {
         no_embed: bool,
     },
     /// Sync the repo directory with the database (detect new/changed/deleted files)
-    Sync,
+    Sync {
+        #[arg(long, help = "Re-embed changed pages after sync")]
+        embed: bool,
+    },
     /// Embed pages into the vector index
     Embed {
-        #[arg(help = "Page slug to embed (omit with --all to embed everything)")]
+        #[arg(help = "Page slug to embed (omit with --all or --stale)")]
         slug: Option<String>,
-        #[arg(long, help = "Embed all pages that are missing embeddings")]
+        #[arg(long, help = "Embed all pages (including already-embedded)")]
         all: bool,
+        #[arg(long, help = "Only embed pages with missing or stale embeddings")]
+        stale: bool,
     },
     /// Extract wikilinks and timeline entries from pages into the graph
     Extract {
@@ -86,8 +91,12 @@ enum Commands {
         #[arg(long, default_value = "out", help = "Direction: out, in, or both")]
         direction: String,
     },
-    /// Show all pages that link to a given page
+    /// Show all pages that link to a given page (incoming links)
     Backlinks {
+        slug: String,
+    },
+    /// Show all pages this page links to (outgoing links with evidence context)
+    Links {
         slug: String,
     },
     /// Add an explicit typed link from one page to another
@@ -176,6 +185,29 @@ enum Commands {
         #[arg(long, help = "Use LLM query expansion for better recall")]
         expand: bool,
     },
+    /// Add a tag to a page
+    Tag {
+        slug: String,
+        tag: String,
+    },
+    /// Remove a tag from a page
+    Untag {
+        slug: String,
+        tag: String,
+    },
+    /// List all tags on a page
+    Tags {
+        slug: String,
+    },
+    /// Export pages to a directory (--format md or json)
+    Export {
+        #[arg(long, default_value = "/tmp/rbrain-export", help = "Output directory")]
+        dir: String,
+        #[arg(long, default_value = "md", help = "Output format: md or json")]
+        format: String,
+    },
+    /// Quality check: report missing titles, unembedded pages, broken links, orphans
+    Lint,
     /// Run health checks and optionally fix common issues
     Doctor {
         #[arg(long, help = "Attempt to fix detected issues automatically")]
@@ -277,11 +309,32 @@ async fn main() -> anyhow::Result<()> {
                 buf
             };
 
-            let page = Page::new(
-                slug,
-                r#type.unwrap_or_else(|| "note".to_string()),
-                content,
-            );
+            // Parse frontmatter so that type/title/tags/timeline are extracted correctly.
+            let parse_result = MarkdownParser::parse(&content);
+            let page_type = r#type
+                .or_else(|| parse_result.frontmatter.get("type").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .unwrap_or_else(|| "note".to_string());
+
+            let mut page = Page::new(slug, page_type, parse_result.compiled_truth);
+            page.timeline = parse_result.timeline;
+            page.frontmatter = parse_result.frontmatter.clone();
+
+            // Extract tags from frontmatter if present
+            if let Some(tags_val) = parse_result.frontmatter.get("tags") {
+                if let Some(arr) = tags_val.as_array() {
+                    page.tags = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                }
+            }
+
+            // Extract title from frontmatter if present
+            if let Some(title_val) = parse_result.frontmatter.get("title") {
+                if let Some(t) = title_val.as_str() {
+                    page.title = t.to_string();
+                }
+            }
+
+            // Detect language from content
+            page.language = Some(detect_lang(&page.compiled_truth));
 
             engine.put_page(page.clone()).await?;
             println!("Page saved: {}", page.slug);
@@ -359,9 +412,13 @@ async fn main() -> anyhow::Result<()> {
                 println!("  {}", slug);
             }
         }
-        Commands::Sync => {
+        Commands::Sync { embed } => {
             let config = Config::load()?;
-            let engine = Engine::open(config.clone()).await?;
+            let engine = if embed {
+                init_engine_with_search(config.clone(), mock_embed).await?
+            } else {
+                Engine::open(config.clone()).await?
+            };
             let (imported, updated, orphaned) = engine.sync().await?;
             println!("Sync complete:");
             println!("  New: {}", imported.len());
@@ -370,18 +427,46 @@ async fn main() -> anyhow::Result<()> {
             if !orphaned.is_empty() {
                 println!("  Orphaned pages: {}", orphaned.join(", "));
             }
+            if embed && engine.has_embedder() {
+                let changed: Vec<String> = imported.iter().chain(updated.iter()).cloned().collect();
+                if !changed.is_empty() {
+                    println!("Re-embedding {} changed page(s)...", changed.len());
+                    for (idx, slug) in changed.iter().enumerate() {
+                        if let Ok(page) = engine.get_page(slug).await {
+                            match engine.chunk_and_embed_page(&page).await {
+                                Ok(_) => println!("  [{}/{}] {}", idx + 1, changed.len(), slug),
+                                Err(e) => eprintln!("  [{}/{}] {} — embed error: {}", idx + 1, changed.len(), slug, e),
+                            }
+                        }
+                    }
+                }
+            }
         }
-        Commands::Embed { slug, all } => {
+        Commands::Embed { slug, all, stale } => {
             let config = Config::load()?;
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
-            
-            if all {
+
+            if stale {
+                let pages = engine.list_stale_pages().await?;
+                if pages.is_empty() {
+                    println!("All pages are up-to-date.");
+                } else {
+                    println!("Embedding {} stale page(s)...", pages.len());
+                    for (idx, page) in pages.iter().enumerate() {
+                        match engine.chunk_and_embed_page(page).await {
+                            Ok(_) => println!("  [{}/{}] {}", idx + 1, pages.len(), page.slug),
+                            Err(e) => eprintln!("  [{}/{}] {} — Error: {}", idx + 1, pages.len(), page.slug, e),
+                        }
+                    }
+                    println!("Done.");
+                }
+            } else if all {
                 let pages = engine.list_pages(None, None).await?;
                 println!("Embedding {} pages...", pages.len());
                 for (idx, page) in pages.iter().enumerate() {
                     match engine.chunk_and_embed_page(page).await {
                         Ok(_) => println!("  [{}/{}] {}", idx + 1, pages.len(), page.slug),
-                        Err(e) => println!("  [{}/{}] {} - Error: {}", idx + 1, pages.len(), page.slug, e),
+                        Err(e) => eprintln!("  [{}/{}] {} — Error: {}", idx + 1, pages.len(), page.slug, e),
                     }
                 }
                 println!("Embedding complete!");
@@ -389,10 +474,10 @@ async fn main() -> anyhow::Result<()> {
                 let page = engine.get_page(&s).await?;
                 match engine.chunk_and_embed_page(&page).await {
                     Ok(_) => println!("Embedded: {}", s),
-                    Err(e) => println!("Error embedding {}: {}", s, e),
+                    Err(e) => eprintln!("Error embedding {}: {}", s, e),
                 }
             } else {
-                eprintln!("Either --all or a slug must be provided");
+                eprintln!("Provide a slug, --all, or --stale");
                 std::process::exit(1);
             }
         }
@@ -444,10 +529,30 @@ async fn main() -> anyhow::Result<()> {
             let engine = Engine::open(config.clone()).await?;
             let links = engine.backlinks(&slug).await?;
             println!("Backlinks to '{}':", slug);
+            if links.is_empty() {
+                println!("  (none — no other page links to this page)");
+            }
             for link in links {
                 println!("  <- {} ({})", link.target_slug, link.edge_type);
                 if let Some(ctx) = &link.context {
                     println!("     Context: {}", ctx);
+                }
+            }
+        }
+        Commands::Links { slug } => {
+            let config = Config::load()?;
+            let engine = Engine::open(config.clone()).await?;
+            let links = engine.outlinks(&slug).await?;
+            println!("Links from '{}':", slug);
+            if links.is_empty() {
+                println!("  (none — this page has no outgoing links)");
+            }
+            for link in &links {
+                println!("  -> {} ({})", link.target_slug, link.edge_type);
+                if let Some(ctx) = &link.context {
+                    let preview: String = ctx.chars().take(200).collect();
+                    let preview = if ctx.chars().count() > 200 { format!("{}…", preview) } else { preview };
+                    println!("     Context: {}", preview);
                 }
             }
         }
@@ -618,6 +723,56 @@ async fn main() -> anyhow::Result<()> {
                 let page = Page::new(slug.clone(), "synthesis".to_string(), reasoning);
                 engine.put_page(page).await?;
                 eprintln!("\nSaved as synthesis page: {}", slug);
+            }
+        }
+        Commands::Tag { slug, tag } => {
+            let config = Config::load()?;
+            let engine = Engine::open(config.clone()).await?;
+            engine.add_tag(&slug, &tag).await?;
+            println!("Tag '{}' added to '{}'", tag, slug);
+        }
+        Commands::Untag { slug, tag } => {
+            let config = Config::load()?;
+            let engine = Engine::open(config.clone()).await?;
+            engine.remove_tag(&slug, &tag).await?;
+            println!("Tag '{}' removed from '{}'", tag, slug);
+        }
+        Commands::Tags { slug } => {
+            let config = Config::load()?;
+            let engine = Engine::open(config.clone()).await?;
+            let page = engine.get_page(&slug).await?;
+            if page.tags.is_empty() {
+                println!("No tags on '{}'.", slug);
+            } else {
+                println!("Tags for '{}':", slug);
+                for tag in &page.tags {
+                    println!("  {}", tag);
+                }
+            }
+        }
+        Commands::Export { dir, format } => {
+            let config = Config::load()?;
+            let engine = Engine::open(config.clone()).await?;
+            let json = format == "json";
+            let out_dir = std::path::Path::new(&dir);
+            let count = engine.export_pages(out_dir, json).await?;
+            println!("Exported {} pages to {} (format={})", count, dir, format);
+        }
+        Commands::Lint => {
+            let config = Config::load()?;
+            let engine = Engine::open(config.clone()).await?;
+            let warnings = engine.lint().await?;
+            if warnings.is_empty() {
+                println!("No issues found — brain looks clean.");
+            } else {
+                let (warns, infos): (Vec<_>, Vec<_>) = warnings.iter().partition(|(lvl, _, _)| lvl == "WARN");
+                for (lvl, slug, msg) in &warnings {
+                    println!("{} {}: {}", lvl, slug, msg);
+                }
+                println!("\n{} warning(s), {} info(s)", warns.len(), infos.len());
+                if warns.iter().any(|(_, _, m)| m.contains("not embedded")) {
+                    eprintln!("\nTip: run `rbrain embed --stale` to fix missing embeddings.");
+                }
             }
         }
         Commands::Doctor { fix } => {
