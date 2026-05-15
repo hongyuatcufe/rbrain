@@ -697,6 +697,18 @@ impl Engine {
     }
 
     pub async fn keyword_search(&self, query: &str, lang: &rbrain_core::page::Language, k: usize) -> Result<Vec<(i64, f32)>> {
+        self.keyword_search_filtered(query, lang, k, None, None).await
+    }
+
+    /// Keyword search with optional page_type and tag filters applied post-Tantivy.
+    pub async fn keyword_search_filtered(
+        &self,
+        query: &str,
+        lang: &rbrain_core::page::Language,
+        k: usize,
+        page_type: Option<&str>,
+        tag: Option<&str>,
+    ) -> Result<Vec<(i64, f32)>> {
         let keyword_index = self
             .inner
             .keyword_index
@@ -706,7 +718,144 @@ impl Engine {
                 message: "Keyword index not configured".to_string(),
             })?;
 
-        keyword_index.search(query, lang, k).await
+        // Fetch extra results so filtering doesn't starve the result set
+        let raw = keyword_index.search(query, lang, k * 5).await?;
+        if raw.is_empty() || (page_type.is_none() && tag.is_none()) {
+            return Ok(raw.into_iter().take(k).collect());
+        }
+
+        // Build a filtered set of allowed chunk IDs via SQL
+        let ids: Vec<i64> = raw.iter().map(|(id, _)| *id).collect();
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+
+        let mut sql = format!(
+            "SELECT c.id FROM chunks c JOIN pages p ON c.page_slug = p.slug WHERE c.id IN ({})",
+            placeholders
+        );
+        let mut conditions = Vec::new();
+        if page_type.is_some() {
+            conditions.push("p.page_type = ?");
+        }
+        if tag.is_some() {
+            conditions.push("p.tags LIKE ?");
+        }
+        if !conditions.is_empty() {
+            sql.push_str(" AND ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+
+        let mut q = sqlx::query(&sql);
+        for id in &ids {
+            q = q.bind(id);
+        }
+        if let Some(pt) = page_type {
+            q = q.bind(pt);
+        }
+        if let Some(tg) = tag {
+            q = q.bind(format!("%{}%", tg));
+        }
+
+        let allowed: std::collections::HashSet<i64> = q
+            .fetch_all(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .iter()
+            .map(|r| r.get::<i64, _>("id"))
+            .collect();
+
+        Ok(raw
+            .into_iter()
+            .filter(|(id, _)| allowed.contains(id))
+            .take(k)
+            .collect())
+    }
+
+    /// Hybrid search with optional page_type and tag filters.
+    pub async fn search_with_context_filtered(
+        &self,
+        query: &str,
+        lang: &rbrain_core::page::Language,
+        k: usize,
+        expand: bool,
+        page_type: Option<&str>,
+        tag: Option<&str>,
+    ) -> Result<Vec<ChunkResult>> {
+        if page_type.is_none() && tag.is_none() {
+            return self.search_with_context(query, lang, k, expand).await;
+        }
+
+        // Run full hybrid search with extra headroom, then filter
+        let ranked = if expand {
+            self.expanded_search(query, lang, k * 5).await?
+        } else {
+            self.hybrid_search(query, lang, k * 5).await?
+        };
+
+        let ids: Vec<i64> = ranked.iter().map(|(id, _)| *id).collect();
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut sql = format!(
+            "SELECT c.id FROM chunks c JOIN pages p ON c.page_slug = p.slug WHERE c.id IN ({})",
+            placeholders
+        );
+        let mut conditions = Vec::new();
+        if page_type.is_some() {
+            conditions.push("p.page_type = ?");
+        }
+        if tag.is_some() {
+            conditions.push("p.tags LIKE ?");
+        }
+        if !conditions.is_empty() {
+            sql.push_str(" AND ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+
+        let mut q = sqlx::query(&sql);
+        for id in &ids {
+            q = q.bind(id);
+        }
+        if let Some(pt) = page_type {
+            q = q.bind(pt);
+        }
+        if let Some(tg) = tag {
+            q = q.bind(format!("%{}%", tg));
+        }
+
+        let allowed: std::collections::HashSet<i64> = q
+            .fetch_all(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .iter()
+            .map(|r| r.get::<i64, _>("id"))
+            .collect();
+
+        let filtered: Vec<(i64, f64)> = ranked
+            .into_iter()
+            .filter(|(id, _)| allowed.contains(id))
+            .take(k)
+            .collect();
+
+        let fetch_ids: Vec<i64> = filtered.iter().map(|(id, _)| *id).collect();
+        let texts = self.fetch_chunks_text(&fetch_ids).await?;
+        let text_map: HashMap<i64, (String, String)> = texts
+            .into_iter()
+            .map(|(id, text, slug)| (id, (text, slug)))
+            .collect();
+
+        Ok(filtered
+            .into_iter()
+            .filter_map(|(id, score)| {
+                text_map.get(&id).map(|(text, slug)| ChunkResult {
+                    chunk_id: id,
+                    score,
+                    text: text.clone(),
+                    page_slug: slug.clone(),
+                })
+            })
+            .collect())
     }
 
     pub async fn hybrid_search(
@@ -1286,21 +1435,48 @@ impl Engine {
             return Ok(format!("No relevant content found in brain for: {}", topic));
         }
 
+        let is_cjk = matches!(lang,
+            rbrain_core::page::Language::ZhHans
+            | rbrain_core::page::Language::ZhHant
+            | rbrain_core::page::Language::Ja
+            | rbrain_core::page::Language::Ko
+        );
+
         let context = chunks
             .iter()
-            .map(|c| format!("[来源: {} | chunk:{}]\n{}", c.page_slug, c.chunk_id, c.text))
+            .map(|c| {
+                if is_cjk {
+                    format!("[来源: {} | chunk:{}]\n{}", c.page_slug, c.chunk_id, c.text)
+                } else {
+                    format!("[source: {} | chunk:{}]\n{}", c.page_slug, c.chunk_id, c.text)
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n\n---\n\n");
 
-        let system = "你是一位严谨的学术研究者。根据提供的原始材料，对给定问题进行深入推理：\
-            1. 梳理材料中的核心观点与论据\
-            2. 指出材料间的张力、矛盾或空白\
-            3. 形成有依据的工作判断（注明不确定之处）\
-            4. 列出尚待回答的开放性问题\
-            5. 用Markdown格式，包含：## 核心观点 / ## 张力与矛盾 / ## 工作判断 / ## 开放问题\
-            引用材料时注明来源slug。";
+        let (system, user) = if is_cjk {
+            let sys = "你是一位严谨的学术研究者。根据提供的原始材料，对给定问题进行深入推理：\
+                1. 梳理材料中的核心观点与论据\
+                2. 指出材料间的张力、矛盾或空白\
+                3. 形成有依据的工作判断（注明不确定之处）\
+                4. 列出尚待回答的开放性问题\
+                5. 用Markdown格式，包含：## 核心观点 / ## 张力与矛盾 / ## 工作判断 / ## 开放问题\
+                引用材料时注明来源slug。";
+            let usr = format!("研究问题：{}\n\n材料：\n\n{}", topic, context);
+            (sys, usr)
+        } else {
+            let sys = "You are a rigorous academic researcher. Based on the provided source materials, \
+                reason deeply about the given question:\
+                1. Identify the core claims and arguments in the materials\
+                2. Note tensions, contradictions, or gaps between sources\
+                3. Form a working judgment (flagging uncertainty where it exists)\
+                4. List open questions that remain unanswered\
+                Use Markdown with sections: ## Core Claims / ## Tensions & Gaps / ## Working Judgment / ## Open Questions\
+                Cite sources by slug when referencing material.";
+            let usr = format!("Research question: {}\n\nSources:\n\n{}", topic, context);
+            (sys, usr)
+        };
 
-        let user = format!("研究问题：{}\n\n材料：\n\n{}", topic, context);
         deepseek.chat(system, &user).await
     }
 
@@ -1379,7 +1555,46 @@ impl Engine {
                 target: row.get("target_slug"),
                 edge_type: row.get("edge_type"),
                 depth: row.get::<i64, _>("depth") as usize,
+                context: None,
             });
+        }
+
+        // Enrich depth-1 edges with context from the links table
+        let depth1_targets: Vec<String> = edges.iter()
+            .filter(|e| e.depth == 1)
+            .map(|e| e.target.clone())
+            .collect();
+
+        if !depth1_targets.is_empty() {
+            // Use all-? style (no ?N mixing) to avoid sqlx binding confusion
+            let ph = depth1_targets.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let ctx_sql = format!(
+                "SELECT target_slug, edge_type, context FROM links WHERE source_slug = ? AND target_slug IN ({})",
+                ph
+            );
+            let mut ctx_q = sqlx::query(&ctx_sql).bind(&normalized);
+            for t in &depth1_targets {
+                ctx_q = ctx_q.bind(t);
+            }
+            let ctx_rows = ctx_q
+                .fetch_all(&self.inner.db)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+            let mut ctx_map: HashMap<(String, String), String> = HashMap::new();
+            for r in ctx_rows {
+                let tgt: String = r.get("target_slug");
+                let et: String = r.get("edge_type");
+                let ctx: Option<String> = r.get("context");
+                if let Some(c) = ctx {
+                    ctx_map.insert((tgt, et), c);
+                }
+            }
+            for edge in edges.iter_mut() {
+                if edge.depth == 1 {
+                    edge.context = ctx_map.get(&(edge.target.clone(), edge.edge_type.clone())).cloned();
+                }
+            }
         }
 
         Ok(edges)
@@ -1810,6 +2025,7 @@ pub struct GraphEdge {
     pub target: String,
     pub edge_type: String,
     pub depth: usize,
+    pub context: Option<String>,
 }
 
 #[derive(Debug, Clone)]

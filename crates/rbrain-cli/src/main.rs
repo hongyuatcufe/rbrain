@@ -132,12 +132,20 @@ enum Commands {
         expand: bool,
         #[arg(short, long, default_value = "10", help = "Max pages to return")]
         limit: usize,
+        #[arg(long, help = "Filter by page type (e.g. book, note, concept)")]
+        r#type: Option<String>,
+        #[arg(long, help = "Filter by tag")]
+        tag: Option<String>,
     },
     /// Keyword-only search (no embedder needed), results grouped by page
     Search {
         query: String,
         #[arg(short, long, default_value = "10", help = "Max pages to return")]
         limit: usize,
+        #[arg(long, help = "Filter by page type (e.g. book, note, concept)")]
+        r#type: Option<String>,
+        #[arg(long, help = "Filter by tag")]
+        tag: Option<String>,
     },
     /// Search relevant chunks and synthesise a wiki page via LLM (DeepSeek)
     Generate {
@@ -522,6 +530,13 @@ async fn main() -> anyhow::Result<()> {
             }
             for edge in edges {
                 println!("  [{}] {} (depth={})", edge.edge_type, edge.target, edge.depth);
+                if let Some(ctx) = &edge.context {
+                    // Show first passage only (split on ---)
+                    let first = ctx.split("\n\n---\n\n").next().unwrap_or(ctx);
+                    let preview: String = first.chars().take(160).collect();
+                    let preview = if first.chars().count() > 160 { format!("{}…", preview) } else { preview };
+                    println!("     Context: {}", preview);
+                }
             }
         }
         Commands::Backlinks { slug } => {
@@ -550,9 +565,19 @@ async fn main() -> anyhow::Result<()> {
             for link in &links {
                 println!("  -> {} ({})", link.target_slug, link.edge_type);
                 if let Some(ctx) = &link.context {
-                    let preview: String = ctx.chars().take(200).collect();
-                    let preview = if ctx.chars().count() > 200 { format!("{}…", preview) } else { preview };
-                    println!("     Context: {}", preview);
+                    let passages: Vec<&str> = ctx.split("\n\n---\n\n").collect();
+                    if passages.len() == 1 {
+                        let preview: String = ctx.chars().take(200).collect();
+                        let preview = if ctx.chars().count() > 200 { format!("{}…", preview) } else { preview };
+                        println!("     Context: {}", preview);
+                    } else {
+                        println!("     Context ({} passages):", passages.len());
+                        for (i, p) in passages.iter().enumerate() {
+                            let preview: String = p.chars().take(160).collect();
+                            let preview = if p.chars().count() > 160 { format!("{}…", preview) } else { preview.to_string() };
+                            println!("       [{}] {}", i + 1, preview);
+                        }
+                    }
                 }
             }
         }
@@ -572,7 +597,7 @@ async fn main() -> anyhow::Result<()> {
                                 chunk_id, page_slug, to
                             );
                         }
-                        Some(text)
+                        Some(format!("[chunk:{}] {}", chunk_id, text))
                     }
                     None => {
                         anyhow::bail!("Chunk {} not found. Run `rbrain search` or `rbrain query` to see chunk IDs.", chunk_id);
@@ -612,12 +637,15 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Query { query, expand, limit } => {
+        Commands::Query { query, expand, limit, r#type, tag } => {
             let config = Config::load()?;
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
             let lang = detect_lang(&query);
 
-            let chunks = engine.search_with_context(&query, &lang, limit * 3, expand).await?;
+            let chunks = engine.search_with_context_filtered(
+                &query, &lang, limit * 3, expand,
+                r#type.as_deref(), tag.as_deref(),
+            ).await?;
 
             if chunks.is_empty() {
                 println!("No results found for: {}", query);
@@ -625,12 +653,15 @@ async fn main() -> anyhow::Result<()> {
                 print_grouped_results(&query, &chunks, limit);
             }
         }
-        Commands::Search { query, limit } => {
+        Commands::Search { query, limit, r#type, tag } => {
             let config = Config::load()?;
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
             let lang = detect_lang(&query);
 
-            let ids = engine.keyword_search(&query, &lang, limit * 3).await?;
+            let ids = engine.keyword_search_filtered(
+                &query, &lang, limit * 3,
+                r#type.as_deref(), tag.as_deref(),
+            ).await?;
             if ids.is_empty() {
                 println!("No results found for: {}", query);
             } else {
