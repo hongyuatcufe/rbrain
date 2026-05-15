@@ -140,6 +140,42 @@ enum Commands {
         #[arg(long, help = "Use LLM query expansion for better recall")]
         expand: bool,
     },
+    /// Add a dated entry to a page's timeline (evidence log)
+    Timeline {
+        slug: String,
+        /// Date in YYYY-MM-DD format (default: today)
+        #[arg(long)]
+        date: Option<String>,
+        /// Timeline entry text
+        #[arg(long)]
+        text: String,
+        /// Optional source citation (person, document, URL)
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Add a short interpretive take to a page (judgment, question, interpretation)
+    Take {
+        slug: String,
+        /// The take content (your interpretation or working judgment)
+        content: String,
+        /// Take kind: interpretation, question, judgment, hypothesis (default: interpretation)
+        #[arg(long, default_value = "interpretation")]
+        kind: String,
+    },
+    /// List all takes (interpretive entries) for a page
+    Takes {
+        slug: String,
+    },
+    /// Deep reasoning synthesis: search context + LLM reasoning artifact (contradictions, open questions, working judgment)
+    Think {
+        topic: String,
+        #[arg(short, long, default_value = "12", help = "Number of context chunks")]
+        limit: usize,
+        #[arg(long, help = "Save the reasoning artifact as a synthesis page")]
+        save: bool,
+        #[arg(long, help = "Use LLM query expansion for better recall")]
+        expand: bool,
+    },
     /// Run health checks and optionally fix common issues
     Doctor {
         #[arg(long, help = "Attempt to fix detected issues automatically")]
@@ -274,7 +310,11 @@ async fn main() -> anyhow::Result<()> {
                     println!("Type: {}", page.page_type);
                     println!("Tags: {}", page.tags.join(", "));
                     println!("Language: {:?}", page.language);
-                    println!("Content:\n{}", page.compiled_truth);
+                    println!("Updated: {}", page.updated_at);
+                    println!("\n{}", page.compiled_truth);
+                    if !page.timeline.trim().is_empty() {
+                        println!("\n---\n\n{}", page.timeline);
+                    }
                 }
                 Err(_) => {
                     eprintln!("Page not found: {}", slug);
@@ -525,6 +565,59 @@ async fn main() -> anyhow::Result<()> {
                 let page = Page::new(slug.clone(), "wiki".to_string(), wiki);
                 engine.put_page(page).await?;
                 eprintln!("\nSaved as wiki page: {}", slug);
+            }
+        }
+        Commands::Timeline { slug, date, text, source } => {
+            let config = Config::load()?;
+            let engine = Engine::open(config.clone()).await?;
+            let date_str = date.unwrap_or_else(|| {
+                chrono::Utc::now().format("%Y-%m-%d").to_string()
+            });
+            engine.add_timeline_entry(&slug, &date_str, &text, source.as_deref()).await?;
+            println!("Timeline entry added to '{}': {} — {}", slug, date_str, text);
+        }
+        Commands::Take { slug, content, kind } => {
+            let config = Config::load()?;
+            let engine = Engine::open(config.clone()).await?;
+            engine.add_take(&slug, &content, &kind).await?;
+            println!("Take added to '{}' [{}]: {}", slug, kind, content);
+        }
+        Commands::Takes { slug } => {
+            let config = Config::load()?;
+            let engine = Engine::open(config.clone()).await?;
+            let page = engine.get_page(&slug).await?;
+            let takes: Vec<&str> = page.timeline
+                .lines()
+                .filter(|l| l.contains("[take/"))
+                .collect();
+            if takes.is_empty() {
+                println!("No takes recorded for '{}'.", slug);
+            } else {
+                println!("Takes for '{}':", slug);
+                for take in takes {
+                    println!("  {}", take);
+                }
+            }
+        }
+        Commands::Think { topic, limit, save, expand } => {
+            let config = Config::load()?;
+            let engine = init_engine_with_search(config.clone(), mock_embed).await?;
+            let lang = detect_lang(&topic);
+
+            eprintln!("Thinking about: {}…", topic);
+            let reasoning = engine.think(&topic, &lang, limit, expand).await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            println!("{}", reasoning);
+
+            if save {
+                let slug = format!(
+                    "synthesis/{}",
+                    topic.to_lowercase().replace(' ', "-").replace(['/', '\\', '.'], "-")
+                );
+                let page = Page::new(slug.clone(), "synthesis".to_string(), reasoning);
+                engine.put_page(page).await?;
+                eprintln!("\nSaved as synthesis page: {}", slug);
             }
         }
         Commands::Doctor { fix } => {

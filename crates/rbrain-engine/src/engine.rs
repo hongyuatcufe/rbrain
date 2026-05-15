@@ -1130,6 +1130,89 @@ impl Engine {
         Ok(rows)
     }
 
+    /// Prepend a dated entry to a page's timeline section.
+    /// Format: `- YYYY-MM-DD: <text> [Source: <source>]`
+    pub async fn add_timeline_entry(
+        &self,
+        slug: &str,
+        date: &str,
+        text: &str,
+        source: Option<&str>,
+    ) -> Result<()> {
+        let mut page = self.get_page(slug).await?;
+        let entry = if let Some(src) = source {
+            format!("- {}: {} [Source: {}]", date, text, src)
+        } else {
+            format!("- {}: {}", date, text)
+        };
+        // Prepend (most-recent-first)
+        page.timeline = if page.timeline.trim().is_empty() {
+            entry
+        } else {
+            format!("{}\n{}", entry, page.timeline)
+        };
+        self.put_page(page).await
+    }
+
+    /// Append a short interpretive take to a page's timeline section.
+    /// Format: `- [take/<kind>] YYYY-MM-DD: <content>`
+    pub async fn add_take(
+        &self,
+        slug: &str,
+        content: &str,
+        kind: &str,
+    ) -> Result<()> {
+        let mut page = self.get_page(slug).await?;
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let entry = format!("- [take/{}] {}: {}", kind, date, content);
+        page.timeline = if page.timeline.trim().is_empty() {
+            entry
+        } else {
+            format!("{}\n{}", page.timeline, entry)
+        };
+        self.put_page(page).await
+    }
+
+    /// Deep-reasoning synthesis: search context, then prompt LLM to reason through
+    /// contradictions, open questions, and form a working judgment.
+    /// Unlike generate_wiki (output-focused), think is reasoning-artifact-focused.
+    pub async fn think(
+        &self,
+        topic: &str,
+        lang: &rbrain_core::page::Language,
+        limit: usize,
+        expand: bool,
+    ) -> Result<String> {
+        let deepseek = self.inner.deepseek.as_ref().ok_or_else(|| {
+            BrainError::ApiUnreachable {
+                provider: "deepseek".to_string(),
+                message: "deepseek.api_key not configured".to_string(),
+            }
+        })?;
+
+        let chunks = self.search_with_context(topic, lang, limit, expand).await?;
+        if chunks.is_empty() {
+            return Ok(format!("No relevant content found in brain for: {}", topic));
+        }
+
+        let context = chunks
+            .iter()
+            .map(|c| format!("[来源: {} | chunk:{}]\n{}", c.page_slug, c.chunk_id, c.text))
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
+
+        let system = "你是一位严谨的学术研究者。根据提供的原始材料，对给定问题进行深入推理：\
+            1. 梳理材料中的核心观点与论据\
+            2. 指出材料间的张力、矛盾或空白\
+            3. 形成有依据的工作判断（注明不确定之处）\
+            4. 列出尚待回答的开放性问题\
+            5. 用Markdown格式，包含：## 核心观点 / ## 张力与矛盾 / ## 工作判断 / ## 开放问题\
+            引用材料时注明来源slug。";
+
+        let user = format!("研究问题：{}\n\n材料：\n\n{}", topic, context);
+        deepseek.chat(system, &user).await
+    }
+
     pub async fn graph_query(
         &self,
         slug: &str,
