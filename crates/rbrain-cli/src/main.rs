@@ -89,6 +89,29 @@ enum Commands {
     Backlinks {
         slug: String,
     },
+    /// Add an explicit typed link from one page to another
+    Link {
+        /// Source page slug
+        from: String,
+        /// Target page slug
+        to: String,
+        /// Link type: evidence, related, person, period, supports, contrasts, develops, mentions, references (default: related)
+        #[arg(long, default_value = "related")]
+        r#type: String,
+        /// Optional context note explaining the link
+        #[arg(long)]
+        context: Option<String>,
+    },
+    /// Remove a link between two pages
+    Unlink {
+        from: String,
+        to: String,
+        /// Only remove links of this type (omit to remove all types between these pages)
+        #[arg(long)]
+        r#type: Option<String>,
+    },
+    /// List pages with no incoming links (orphan pages not referenced by any other page)
+    Orphans,
     /// Hybrid search (vector + keyword + RRF), results grouped by page
     Query {
         query: String,
@@ -381,6 +404,35 @@ async fn main() -> anyhow::Result<()> {
                 println!("  <- {} ({})", link.target_slug, link.edge_type);
                 if let Some(ctx) = &link.context {
                     println!("     Context: {}", ctx);
+                }
+            }
+        }
+        Commands::Link { from, to, r#type, context } => {
+            let config = Config::load()?;
+            let engine = Engine::open(config.clone()).await?;
+            engine.add_link(&from, &to, &r#type, context.as_deref()).await?;
+            println!("Link added: {} --[{}]--> {}", from, r#type, to);
+        }
+        Commands::Unlink { from, to, r#type } => {
+            let config = Config::load()?;
+            let engine = Engine::open(config.clone()).await?;
+            let removed = engine.remove_link(&from, &to, r#type.as_deref()).await?;
+            if removed > 0 {
+                println!("Removed {} link(s): {} --> {}", removed, from, to);
+            } else {
+                println!("No matching link found: {} --> {}", from, to);
+            }
+        }
+        Commands::Orphans => {
+            let config = Config::load()?;
+            let engine = Engine::open(config.clone()).await?;
+            let orphans = engine.orphan_pages().await?;
+            if orphans.is_empty() {
+                println!("No orphan pages — every page has at least one incoming link.");
+            } else {
+                println!("{} orphan page(s) (no incoming links):", orphans.len());
+                for slug in &orphans {
+                    println!("  {}", slug);
                 }
             }
         }

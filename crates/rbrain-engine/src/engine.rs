@@ -1046,6 +1046,74 @@ impl Engine {
         Ok(links)
     }
 
+    /// Add an explicit typed link between two pages (does not require [[wikilink]] syntax).
+    /// Edge type defaults to "related" if not specified.
+    /// Valid types: evidence, related, person, period, supports, contrasts, develops, mentions, references
+    pub async fn add_link(
+        &self,
+        source_slug: &str,
+        target_slug: &str,
+        edge_type: &str,
+        context: Option<&str>,
+    ) -> Result<()> {
+        let source = MarkdownParser::normalize_slug(source_slug);
+        let target = MarkdownParser::normalize_slug(target_slug);
+        sqlx::query(
+            "INSERT OR REPLACE INTO links (source_slug, target_slug, edge_type, context) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(&source)
+        .bind(&target)
+        .bind(edge_type)
+        .bind(context)
+        .execute(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        Ok(())
+    }
+
+    /// Remove a link between two pages (optionally filter by edge type).
+    pub async fn remove_link(
+        &self,
+        source_slug: &str,
+        target_slug: &str,
+        edge_type: Option<&str>,
+    ) -> Result<u64> {
+        let source = MarkdownParser::normalize_slug(source_slug);
+        let target = MarkdownParser::normalize_slug(target_slug);
+        let result = if let Some(et) = edge_type {
+            sqlx::query(
+                "DELETE FROM links WHERE source_slug = ?1 AND target_slug = ?2 AND edge_type = ?3",
+            )
+            .bind(&source)
+            .bind(&target)
+            .bind(et)
+            .execute(&self.inner.db)
+            .await
+        } else {
+            sqlx::query("DELETE FROM links WHERE source_slug = ?1 AND target_slug = ?2")
+                .bind(&source)
+                .bind(&target)
+                .execute(&self.inner.db)
+                .await
+        }
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        Ok(result.rows_affected())
+    }
+
+    /// Find pages that have no incoming links (orphan pages).
+    pub async fn orphan_pages(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT slug FROM pages \
+             WHERE slug NOT IN (SELECT DISTINCT target_slug FROM links) \
+             ORDER BY slug",
+        )
+        .fetch_all(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        Ok(rows)
+    }
+
     pub async fn graph_query(
         &self,
         slug: &str,
