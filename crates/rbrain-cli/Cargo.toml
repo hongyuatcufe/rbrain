@@ -24,6 +24,8 @@ tracing-subscriber = { workspace = true }
 sqlx = { workspace = true }
 chrono = { workspace = true }
 whatlang = { workspace = true }
+indicatif = "0.17"
+walkdir = { workspace = true }
 
 [lints]
 workspace = true

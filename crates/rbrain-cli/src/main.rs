@@ -459,25 +459,59 @@ async fn main() -> anyhow::Result<()> {
                 if pages.is_empty() {
                     println!("All pages are up-to-date.");
                 } else {
-                    println!("Embedding {} stale page(s)...", pages.len());
-                    for (idx, page) in pages.iter().enumerate() {
+                    let pb = indicatif::ProgressBar::new(pages.len() as u64);
+                    pb.set_style(
+                        indicatif::ProgressStyle::with_template(
+                            "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}"
+                        )
+                        .unwrap()
+                        .progress_chars("=>-"),
+                    );
+                    pb.set_message("embedding stale pages...");
+                    let mut errors = 0usize;
+                    for page in pages.iter() {
+                        pb.set_message(page.slug.clone());
                         match engine.chunk_and_embed_page(page).await {
-                            Ok(_) => println!("  [{}/{}] {}", idx + 1, pages.len(), page.slug),
-                            Err(e) => eprintln!("  [{}/{}] {} — Error: {}", idx + 1, pages.len(), page.slug, e),
+                            Ok(_) => {}
+                            Err(e) => {
+                                pb.println(format!("  WARN {}: {}", page.slug, e));
+                                errors += 1;
+                            }
                         }
+                        pb.inc(1);
                     }
-                    println!("Done.");
+                    pb.finish_with_message(format!(
+                        "done ({} ok, {} errors)",
+                        pages.len() - errors, errors
+                    ));
                 }
             } else if all {
                 let pages = engine.list_pages(None, None).await?;
-                println!("Embedding {} pages...", pages.len());
-                for (idx, page) in pages.iter().enumerate() {
+                let pb = indicatif::ProgressBar::new(pages.len() as u64);
+                pb.set_style(
+                    indicatif::ProgressStyle::with_template(
+                        "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}"
+                    )
+                    .unwrap()
+                    .progress_chars("=>-"),
+                );
+                pb.set_message("embedding...");
+                let mut errors = 0usize;
+                for page in pages.iter() {
+                    pb.set_message(page.slug.clone());
                     match engine.chunk_and_embed_page(page).await {
-                        Ok(_) => println!("  [{}/{}] {}", idx + 1, pages.len(), page.slug),
-                        Err(e) => eprintln!("  [{}/{}] {} — Error: {}", idx + 1, pages.len(), page.slug, e),
+                        Ok(_) => {}
+                        Err(e) => {
+                            pb.println(format!("  WARN {}: {}", page.slug, e));
+                            errors += 1;
+                        }
                     }
+                    pb.inc(1);
                 }
-                println!("Embedding complete!");
+                pb.finish_with_message(format!(
+                    "complete ({} ok, {} errors)",
+                    pages.len() - errors, errors
+                ));
             } else if let Some(s) = slug {
                 let page = engine.get_page(&s).await?;
                 match engine.chunk_and_embed_page(&page).await {
@@ -810,32 +844,82 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::load()?;
             let engine = Engine::open(config.clone()).await?;
 
+            // ── Stats ────────────────────────────────────────────────────────
+            let stats = engine.get_stats().await?;
+            let coverage_by_type = engine.embedding_coverage_by_type().await?;
+            let top_linked = engine.top_pages_by_indegree(5).await?;
+            let orphans = engine.orphan_pages().await?;
+
+            println!("═══ Brain Health Report ════════════════════════════════");
+
+            // Pages by type
+            println!("\n── Pages ──────────────────────────────────────────────");
+            println!("  Total: {}", stats.total_pages());
+            let mut types: Vec<_> = stats.pages_by_type.iter().collect();
+            types.sort_by(|a, b| b.1.cmp(a.1));
+            for (t, n) in &types {
+                println!("  {:12} {}", t, n);
+            }
+
+            // Embedding coverage
+            println!("\n── Embedding Coverage ─────────────────────────────────");
+            println!("  Overall: {:.1}%  ({} / {} chunks)",
+                stats.embedding_coverage,
+                (stats.total_chunks as f64 * stats.embedding_coverage / 100.0) as i64,
+                stats.total_chunks);
+            for (t, emb, total) in &coverage_by_type {
+                let pct = if *total > 0 { (*emb as f64 / *total as f64) * 100.0 } else { 100.0 };
+                let bar_len = (pct / 5.0) as usize; // 20-char bar
+                let bar = format!("{}{}", "█".repeat(bar_len), "░".repeat(20 - bar_len));
+                println!("  {:12} [{bar}] {:.0}%  ({emb}/{total} chunks)",
+                    t, pct, emb = emb, total = total);
+            }
+
+            // Graph
+            println!("\n── Graph ──────────────────────────────────────────────");
+            let link_count = engine.link_count().await?;
+            println!("  Links: {}   Orphans: {}   Density: {:.2} edges/page",
+                link_count, orphans.len(), stats.graph_density);
+            println!("  Top-linked pages:");
+            for (slug, deg) in &top_linked {
+                println!("    {:3} ← {}", deg, slug);
+            }
+
+            // Storage
+            println!("\n── Storage ────────────────────────────────────────────");
+            let db_size = std::fs::metadata(&config.db_path).map(|m| m.len()).unwrap_or(0);
+            let vec_size = std::fs::metadata(&config.vectors_path).map(|m| m.len()).unwrap_or(0);
+            let tantivy_size: u64 = walkdir::WalkDir::new(&config.tantivy_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum();
+            println!("  SQLite DB:     {}", fmt_bytes(db_size));
+            println!("  Vector store:  {}", fmt_bytes(vec_size));
+            println!("  Tantivy index: {}", fmt_bytes(tantivy_size));
+
+            // Issues
+            println!("\n── Issues ─────────────────────────────────────────────");
             let issues = engine.health_check().await?;
-
             if issues.is_empty() {
-                println!("Brain is healthy!");
+                println!("  ✓ No issues found");
             } else {
-                println!("Found {} issues:", issues.len());
                 for issue in &issues {
-                    println!("  - {}", issue);
+                    println!("  ✗ {}", issue);
                 }
-
+                if !orphans.is_empty() {
+                    println!("  ✗ {} orphan pages (no incoming links) — run `rbrain orphans`", orphans.len());
+                }
                 if fix {
                     let fixed_chunks = engine.fix_stale_chunks().await?;
-                    if fixed_chunks > 0 {
-                        println!("  Queued {} pages for re-embedding", fixed_chunks);
-                    }
-
-                    let fixed_orphans = engine.fix_orphan_pages().await?;
-                    if fixed_orphans > 0 {
-                        println!("  Removed {} orphan pages", fixed_orphans);
-                    }
-
-                    println!("Brain repairs complete!");
+                    if fixed_chunks > 0 { println!("  → Queued {} pages for re-embedding", fixed_chunks); }
+                    println!("  Repairs complete.");
                 } else {
-                    std::process::exit(1);
+                    println!("\nTip: run `rbrain doctor --fix` to auto-repair, or `rbrain embed --stale`.");
                 }
             }
+            println!("═══════════════════════════════════════════════════════");
         }
         Commands::Stats => {
             let config = Config::load()?;
@@ -1080,6 +1164,13 @@ fn update_gitignore(project_dir: &std::path::Path) -> anyhow::Result<()> {
         std::fs::write(&gitignore, entry)?;
     }
     Ok(())
+}
+
+fn fmt_bytes(n: u64) -> String {
+    if n < 1024 { format!("{} B", n) }
+    else if n < 1024 * 1024 { format!("{:.1} KB", n as f64 / 1024.0) }
+    else if n < 1024 * 1024 * 1024 { format!("{:.1} MB", n as f64 / 1024.0 / 1024.0) }
+    else { format!("{:.2} GB", n as f64 / 1024.0 / 1024.0 / 1024.0) }
 }
 
 fn detect_lang(text: &str) -> rbrain_core::page::Language {

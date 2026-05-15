@@ -636,6 +636,15 @@ impl Engine {
     pub async fn import_dir(&self, dir: &str) -> Result<Vec<String>> {
         let mut imported = Vec::new();
 
+        // When `dir` is a single file, use its parent as the prefix base so the
+        // slug becomes the filename (without extension) rather than an empty string.
+        let base_path = std::path::Path::new(dir);
+        let prefix = if base_path.is_file() {
+            base_path.parent().unwrap_or(base_path).to_path_buf()
+        } else {
+            base_path.to_path_buf()
+        };
+
         for entry in WalkDir::new(dir)
             .into_iter()
             .filter_map(|e| e.ok())
@@ -645,7 +654,7 @@ impl Engine {
             let content = std::fs::read_to_string(path)?;
             let hash = MarkdownParser::content_hash(&content);
 
-            let relative = path.strip_prefix(dir)
+            let relative = path.strip_prefix(&prefix)
                 .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
             let slug = relative.to_string_lossy()
                 .trim_end_matches(".md")
@@ -1335,6 +1344,47 @@ impl Engine {
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(rows)
+    }
+
+    /// Total number of links in the graph.
+    pub async fn link_count(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM links")
+            .fetch_one(&self.inner.db)
+            .await
+            .unwrap_or(0))
+    }
+
+    /// Return the top-n pages by incoming link count (indegree).
+    pub async fn top_pages_by_indegree(&self, n: usize) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT p.slug, COALESCE(ps.indegree, 0) as indegree \
+             FROM pages p LEFT JOIN page_stats ps ON p.slug = ps.slug \
+             ORDER BY indegree DESC LIMIT ?1"
+        )
+        .bind(n as i64)
+        .fetch_all(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        Ok(rows.iter().map(|r| (r.get::<String, _>("slug"), r.get::<i64, _>("indegree"))).collect())
+    }
+
+    /// Return (embedded_chunks, total_chunks) counts by page_type.
+    pub async fn embedding_coverage_by_type(&self) -> Result<Vec<(String, i64, i64)>> {
+        let rows = sqlx::query(
+            "SELECT p.page_type, \
+             COUNT(c.id) as total, \
+             SUM(CASE WHEN c.has_embedding = 1 THEN 1 ELSE 0 END) as embedded \
+             FROM pages p LEFT JOIN chunks c ON c.page_slug = p.slug \
+             GROUP BY p.page_type ORDER BY total DESC"
+        )
+        .fetch_all(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        Ok(rows.iter().map(|r| (
+            r.get::<String, _>("page_type"),
+            r.get::<i64, _>("embedded"),
+            r.get::<i64, _>("total"),
+        )).collect())
     }
 
     /// Prepend a dated entry to a page's timeline section.
