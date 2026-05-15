@@ -156,6 +156,12 @@ pub struct ChunkResult {
     pub text: String,
 }
 
+/// Wrapper for Vec<ChunkResult> — MCP spec requires root type 'object'
+#[derive(Serialize, JsonSchema)]
+pub struct ChunkList {
+    pub results: Vec<ChunkResult>,
+}
+
 #[derive(Serialize, JsonSchema)]
 pub struct PageResult {
     pub slug: String,
@@ -175,6 +181,12 @@ pub struct PageSummary {
     pub page_type: String,
     pub language: Option<String>,
     pub updated_at: String,
+}
+
+/// Wrapper for Vec<PageSummary>
+#[derive(Serialize, JsonSchema)]
+pub struct PageList {
+    pub results: Vec<PageSummary>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -204,11 +216,43 @@ pub struct GraphEdge {
     pub depth: usize,
 }
 
+/// Wrapper for Vec<GraphEdge>
+#[derive(Serialize, JsonSchema)]
+pub struct GraphList {
+    pub results: Vec<GraphEdge>,
+}
+
 #[derive(Serialize, JsonSchema)]
 pub struct LinkRef {
     pub source_slug: String,
     pub edge_type: String,
     pub context: Option<String>,
+}
+
+/// Wrapper for Vec<LinkRef>
+#[derive(Serialize, JsonSchema)]
+pub struct LinkList {
+    pub results: Vec<LinkRef>,
+}
+
+/// Wrapper for Vec<String> (orphan slugs)
+#[derive(Serialize, JsonSchema)]
+pub struct SlugList {
+    pub slugs: Vec<String>,
+}
+
+/// Wrapper for brain_get (Option<PageResult> is not a valid root object)
+#[derive(Serialize, JsonSchema)]
+pub struct GetResult {
+    /// true if the page was found
+    pub found: bool,
+    pub page: Option<PageResult>,
+}
+
+/// Wrapper for brain_think (String is not a valid root object)
+#[derive(Serialize, JsonSchema)]
+pub struct ThinkResult {
+    pub reasoning: String,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -243,14 +287,14 @@ impl RBrainMcpServer {
         description = "Hybrid search combining vector similarity and keyword search (RRF fusion). \
             Returns ranked text chunks with source page. Use before writing wiki pages or answering questions."
     )]
-    async fn query(&self, Parameters(args): Parameters<QueryArgs>) -> Json<Vec<ChunkResult>> {
+    async fn query(&self, Parameters(args): Parameters<QueryArgs>) -> Json<ChunkList> {
         let limit = args.limit.map(|l| l.clamp(1, 50) as usize).unwrap_or(10);
         let expand = args.expand.unwrap_or(false);
         let lang = detect_lang(&args.query);
 
         match self.engine.search_with_context(&args.query, &lang, limit, expand).await {
-            Ok(chunks) => Json(
-                chunks
+            Ok(chunks) => Json(ChunkList {
+                results: chunks
                     .into_iter()
                     .map(|c| ChunkResult {
                         page_slug: c.page_slug,
@@ -259,10 +303,10 @@ impl RBrainMcpServer {
                         text: c.text,
                     })
                     .collect(),
-            ),
+            }),
             Err(e) => {
                 tracing::error!("brain_query error: {}", e);
-                Json(vec![])
+                Json(ChunkList { results: vec![] })
             }
         }
     }
@@ -272,19 +316,22 @@ impl RBrainMcpServer {
         name = "brain_get",
         description = "Retrieve a page by its slug. Returns the full Markdown content, tags, and metadata."
     )]
-    async fn get(&self, Parameters(args): Parameters<GetArgs>) -> Json<Option<PageResult>> {
+    async fn get(&self, Parameters(args): Parameters<GetArgs>) -> Json<GetResult> {
         match self.engine.get_page(&args.slug).await {
-            Ok(page) => Json(Some(PageResult {
-                slug: page.slug,
-                title: page.title,
-                page_type: page.page_type,
-                tags: page.tags,
-                language: page.language.as_ref().map(|l| l.to_string()),
-                compiled_truth: page.compiled_truth,
-                timeline: page.timeline,
-                updated_at: page.updated_at.to_string(),
-            })),
-            Err(_) => Json(None),
+            Ok(page) => Json(GetResult {
+                found: true,
+                page: Some(PageResult {
+                    slug: page.slug,
+                    title: page.title,
+                    page_type: page.page_type,
+                    tags: page.tags,
+                    language: page.language.as_ref().map(|l| l.to_string()),
+                    compiled_truth: page.compiled_truth,
+                    timeline: page.timeline,
+                    updated_at: page.updated_at.to_string(),
+                }),
+            }),
+            Err(_) => Json(GetResult { found: false, page: None }),
         }
     }
 
@@ -323,14 +370,14 @@ impl RBrainMcpServer {
         name = "brain_list",
         description = "List all pages with optional type or tag filter. Returns summaries without full content."
     )]
-    async fn list(&self, Parameters(args): Parameters<ListArgs>) -> Json<Vec<PageSummary>> {
+    async fn list(&self, Parameters(args): Parameters<ListArgs>) -> Json<PageList> {
         match self
             .engine
             .list_pages(args.page_type.as_deref(), args.tag.as_deref())
             .await
         {
-            Ok(pages) => Json(
-                pages
+            Ok(pages) => Json(PageList {
+                results: pages
                     .into_iter()
                     .map(|p| PageSummary {
                         slug: p.slug,
@@ -340,8 +387,8 @@ impl RBrainMcpServer {
                         updated_at: p.updated_at.to_string(),
                     })
                     .collect(),
-            ),
-            Err(_) => Json(vec![]),
+            }),
+            Err(_) => Json(PageList { results: vec![] }),
         }
     }
 
@@ -351,7 +398,7 @@ impl RBrainMcpServer {
         description = "Traverse the knowledge graph starting from a page. \
             direction='out' follows links this page makes, 'in' finds pages linking here, 'both' does both."
     )]
-    async fn graph(&self, Parameters(args): Parameters<GraphArgs>) -> Json<Vec<GraphEdge>> {
+    async fn graph(&self, Parameters(args): Parameters<GraphArgs>) -> Json<GraphList> {
         let depth = args.depth.map(|d| d.clamp(1, 5) as usize).unwrap_or(2);
         let direction = args.direction.as_deref().unwrap_or("out");
 
@@ -360,8 +407,8 @@ impl RBrainMcpServer {
             .graph_query(&args.slug, args.edge_type.as_deref(), depth, direction)
             .await
         {
-            Ok(edges) => Json(
-                edges
+            Ok(edges) => Json(GraphList {
+                results: edges
                     .into_iter()
                     .map(|e| GraphEdge {
                         target: e.target,
@@ -369,8 +416,8 @@ impl RBrainMcpServer {
                         depth: e.depth,
                     })
                     .collect(),
-            ),
-            Err(_) => Json(vec![]),
+            }),
+            Err(_) => Json(GraphList { results: vec![] }),
         }
     }
 
@@ -379,10 +426,10 @@ impl RBrainMcpServer {
         name = "brain_backlinks",
         description = "Find all pages that link to the given page. Useful for discovering related content and context."
     )]
-    async fn backlinks(&self, Parameters(args): Parameters<BacklinksArgs>) -> Json<Vec<LinkRef>> {
+    async fn backlinks(&self, Parameters(args): Parameters<BacklinksArgs>) -> Json<LinkList> {
         match self.engine.backlinks(&args.slug).await {
-            Ok(links) => Json(
-                links
+            Ok(links) => Json(LinkList {
+                results: links
                     .into_iter()
                     .map(|l| LinkRef {
                         source_slug: l.target_slug,
@@ -390,8 +437,8 @@ impl RBrainMcpServer {
                         context: l.context,
                     })
                     .collect(),
-            ),
-            Err(_) => Json(vec![]),
+            }),
+            Err(_) => Json(LinkList { results: vec![] }),
         }
     }
 
@@ -531,10 +578,10 @@ impl RBrainMcpServer {
         description = "Find pages that have no incoming links — not referenced by any other page. \
             Use to discover isolated knowledge that needs to be connected to the graph."
     )]
-    async fn orphans(&self) -> Json<Vec<String>> {
+    async fn orphans(&self) -> Json<SlugList> {
         match self.engine.orphan_pages().await {
-            Ok(slugs) => Json(slugs),
-            Err(_) => Json(vec![]),
+            Ok(slugs) => Json(SlugList { slugs }),
+            Err(_) => Json(SlugList { slugs: vec![] }),
         }
     }
 
@@ -545,13 +592,13 @@ impl RBrainMcpServer {
             core claims, tensions & contradictions, working judgment, open questions. \
             Returns a Markdown reasoning artifact with inline citations. Requires deepseek.api_key."
     )]
-    async fn think(&self, Parameters(args): Parameters<ThinkArgs>) -> Json<String> {
+    async fn think(&self, Parameters(args): Parameters<ThinkArgs>) -> Json<ThinkResult> {
         let lang = detect_lang(&args.topic);
         let limit = args.limit.map(|l| l.clamp(1, 20) as usize).unwrap_or(12);
         let expand = args.expand.unwrap_or(false);
         match self.engine.think(&args.topic, &lang, limit, expand).await {
-            Ok(result) => Json(result),
-            Err(e) => Json(format!("Error: {}", e)),
+            Ok(result) => Json(ThinkResult { reasoning: result }),
+            Err(e) => Json(ThinkResult { reasoning: format!("Error: {}", e) }),
         }
     }
 
@@ -618,10 +665,10 @@ impl RBrainMcpServer {
         description = "Find all pages that this page links to (outgoing links). \
             Complement to brain_backlinks. Shows what a page references or cites."
     )]
-    async fn outlinks(&self, Parameters(args): Parameters<OutlinksArgs>) -> Json<Vec<LinkRef>> {
+    async fn outlinks(&self, Parameters(args): Parameters<OutlinksArgs>) -> Json<LinkList> {
         match self.engine.outlinks(&args.slug).await {
-            Ok(links) => Json(
-                links
+            Ok(links) => Json(LinkList {
+                results: links
                     .into_iter()
                     .map(|l| LinkRef {
                         source_slug: l.target_slug,
@@ -629,8 +676,8 @@ impl RBrainMcpServer {
                         context: l.context,
                     })
                     .collect(),
-            ),
-            Err(_) => Json(vec![]),
+            }),
+            Err(_) => Json(LinkList { results: vec![] }),
         }
     }
 }
