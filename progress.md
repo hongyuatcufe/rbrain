@@ -19,19 +19,61 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 | Timeline / Take / Think | ✅ 完成 |
 | Tag 管理（tag/untag/tags） | ✅ 完成 |
 | Lint / Export / embed --stale | ✅ 完成 |
-| MCP server（brain_query/link/unlink/orphans） | ✅ 完成 |
+| MCP server（17 个工具，stdio + HTTP） | ✅ 完成 |
 | Claude Code slash command（/rbrain, /rbrain-edu） | ✅ 完成 |
+| Signal-detector 行为（slash command 内自动捕捉概念） | ✅ 完成 |
 | --mock-embed 全局标志 | ✅ 完成 |
 | search/query --type/--tag 过滤 | ✅ 完成 |
 | graph-query depth-1 context 显示 | ✅ 完成 |
 | links 多段 evidence 展示（passages） | ✅ 完成 |
 | think 多语言 prompt（CJK/EN） | ✅ 完成 |
-| Embed 进度条（indicatif） | ⬜ 待做 |
+| Embed 进度条（indicatif） | ✅ 完成 |
+| Doctor 增强（embedding 覆盖率/indegree/存储大小） | ✅ 完成 |
 | Salience / Anomalies / Dream cycle | ⬜ 待做 |
 
 ---
 
 ## 提交历史
+
+### Commit 9 — MCP output schema 修复
+
+**日期**: 2026-05-15
+
+**问题**: rmcp 1.7.0 要求所有 tool output schema 根类型必须为 `object`，返回 `Vec<T>`、`Option<T>`、`String` 的工具导致服务器启动时 panic，MCP 完全不可用。
+
+**修复**: 为所有受影响的工具定义 wrapper struct：
+- `ChunkList { results: Vec<ChunkResult> }` → brain_query
+- `PageList { results: Vec<PageSummary> }` → brain_list
+- `GraphList { results: Vec<GraphEdge> }` → brain_graph
+- `LinkList { results: Vec<LinkRef> }` → brain_backlinks + brain_outlinks
+- `SlugList { slugs: Vec<String> }` → brain_orphans
+- `GetResult { found: bool, page: Option<PageResult> }` → brain_get
+- `ThinkResult { reasoning: String }` → brain_think
+
+---
+
+### Commit 8 — MCP 工具扩展 + Signal-Detector 行为
+
+**日期**: 2026-05-15
+
+**MCP 新增工具（lib.rs + http.rs）**:
+
+| 工具 | 对应 engine 方法 | 说明 |
+|------|----------------|------|
+| `brain_think` | `engine.think()` | 深度推理，返回核心观点/张力/工作判断/开放问题 |
+| `brain_add_timeline_entry` | `engine.add_timeline_entry()` | 给任意页面追加带日期的事件记录 |
+| `brain_add_tag` | `engine.add_tag()` | 通过 MCP 给页面加标签 |
+| `brain_remove_tag` | `engine.remove_tag()` | 通过 MCP 移除标签 |
+| `brain_outlinks` | `engine.outlinks()` | 查出链（与 brain_backlinks 对称） |
+
+**Signal-Detector 行为层**:
+- `/rbrain` slash command 追加 Signal Detection section：检测到原创思考 → `brain_put` 到 `concepts/`，检测到人名 → `brain_add_timeline_entry` 到 `figures/`，建立后 → `brain_link` 关联来源 chunk
+- `/rbrain-edu` 同样追加，路径改为 `research/concepts/`、`research/figures/`、`research/periods/`
+- 每次会话结束输出 signal log
+
+**背景**: gbrain 的核心工作流是 signal-detector skill 在每条消息后台自动捕捉原创观点和概念引用并写入 brain。rbrain 现在通过 slash command 行为指令实现相同效果。
+
+---
 
 ### Commit 7 — query --type/--tag crowding-out bug fix
 **日期**: 2026-05-15
@@ -65,11 +107,30 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 
 ---
 
-### Commit 5 — Phase 2 Easy batch + bug fixes
+### Commit 5 — Embed 进度条 + Doctor 增强 + import_dir 修复
+**日期**: 2026-05-15
+
+**embed 进度条**:
+- `embed --all` 和 `embed --stale` 使用 indicatif 显示 `[===>] 42/150 pages + 当前 slug`
+
+**doctor 增强**:
+- 各类型 embedding 覆盖率（带 bar chart）
+- top-5 高 indegree 页面
+- 存储大小：SQLite / Vector store / Tantivy
+
+**engine 新方法**:
+- `link_count()` / `top_pages_by_indegree(n)` / `embedding_coverage_by_type()`
+
+**import_dir 修复**:
+- 传入单个文件路径时，`strip_prefix` 用父目录而非文件本身，避免 slug 为空
+
+---
+
+### Commit 4 — Phase 2 Easy batch + bug fixes
 **日期**: 2026-05-15
 
 **新增命令**:
-- `rbrain links <slug>` — 查出链（与 backlinks 对称），显示 edge type + evidence context
+- `rbrain links <slug>` — 查出链，显示 edge type + evidence context
 - `rbrain tag/untag/tags <slug> [tag]` — 标签管理
 - `rbrain export --dir <path> --format md|json` — 导出所有页面
 - `rbrain lint` — 质量检查：缺 title、未嵌入页、孤立页、broken links
@@ -77,24 +138,14 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 - `rbrain sync --embed` — sync + 自动 re-embed 改动页面
 
 **Bug 修复**:
-1. `add_timeline_entry` / `add_take` 调用 `put_page` 会清空 explicit links → 改为直接 SQL UPDATE，links 不受影响
-2. `put` 命令不解析 frontmatter，导致 type/title/tags 丢失 → 先调 `MarkdownParser::parse()` 再建 page
-3. `add_link` 对同一 (source, target, type) 的第二次调用会覆盖 context → 改为追加（多段原文用 `---` 分隔）
+1. `add_timeline_entry` / `add_take` 调用 `put_page` 会清空 explicit links → 改为直接 SQL UPDATE
+2. `put` 命令不解析 frontmatter，导致 type/title/tags 丢失 → 先调 `MarkdownParser::parse()`
+3. `add_link` 对同一 (source, target, type) 的第二次调用会覆盖 context → 改为追加（`---` 分隔）
 4. `rbrain backlinks` 空结果静默 → 现在明确提示 `(none)`
-
-**新增 engine 方法**:
-- `outlinks(slug)` — 查出链
-- `add_tag(slug, tag)` / `remove_tag(slug, tag)` / `list_stale_pages()` — 标签和 stale 管理
-- `lint()` — 返回 (level, slug, message) 警告列表
-- `export_pages(dir, json)` — 批量导出
-
-**Skill 重构**:
-- `~/.claude/commands/rbrain.md` → 通用版（领域无关示例，标准路径 notes/concepts/questions/）
-- `~/.claude/commands/rbrain-edu.md` → 新建，教育史专用（中文示例，research/figures/periods/ 路径）
 
 ---
 
-### Commit 4 — Timeline, Take, Think + chunk 锚定 evidence
+### Commit 3 — Timeline, Take, Think + chunk 锚定 evidence
 **日期**: 2026-05-14/15
 
 - `rbrain timeline/take/takes/think` CLI 命令
@@ -105,7 +156,7 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 
 ---
 
-### Commit 3 — Bug fixes（集成测试发现）
+### Commit 2 — Bug fixes（集成测试发现）
 **日期**: 2026-05-14
 
 - `import_dir` 只调 put_page，忘了调 chunk_and_embed → 修复
@@ -116,7 +167,7 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 
 ---
 
-### Commit 2 — Link, Unlink, Orphans
+### Commit 1 — Link, Unlink, Orphans + Graph query
 **日期**: 2026-05-14
 
 - `rbrain link/unlink/orphans` CLI
@@ -125,7 +176,7 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 
 ---
 
-### Commit 1 — Initial release v0.1.0
+### Commit 0 — Initial release v0.1.0
 **日期**: 2026-05-14
 
 - 8 个 crate 架构
@@ -140,13 +191,13 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 
 ## 已知限制
 
-1. **links 唯一约束**：`UNIQUE(source_slug, target_slug, edge_type)` — 同一本书同类型 link 已改为 context 追加（`---` 分隔），仍是一行记录。如需完全独立的多条 link，需迁移 schema 加 `chunk_id` 列。
+1. **links 唯一约束**：`UNIQUE(source_slug, target_slug, edge_type)` — 同一来源同类型 link 改为 context 追加（`---` 分隔），仍是一行记录。如需完全独立的多条 link，需迁移 schema 加 `chunk_id` 列。
 
 2. **旧 evidence context 无 chunk ID 前缀**：Commit 6 之前通过 `--from-chunk` 存储的 context 没有 `[chunk:ID]` 前缀，新增的才有。
 
-3. **embed 进度条**：`embed --all` 只打印行文本，无 indicatif 进度条。
+3. **Dream cycle**：自动维护（lint→embed→extract→synthesize）尚未实现。
 
-4. **Dream cycle**：自动维护（lint→embed→extract→synthesize）尚未实现。
+4. **language detection 不准**：简体中文文档有时被检测为 `zh-hant`，影响分词器选择。非阻塞性问题。
 
 ---
 
@@ -160,7 +211,7 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 
 ## 下一步（按优先级）
 
-1. embed 进度条（indicatif，~1h）
-2. `rbrain doctor` 增强（embedding 覆盖率、最大 indegree、tantivy index 大小）
-3. Salience 排序（情感权重 × 时间衰减）
-4. Dream cycle 简化版（4 阶段：lint→embed--stale→extract--all→generate stale synthesis）
+1. `rbrain doctor` 增强（embedding 覆盖率、最大 indegree、tantivy index 大小）→ ✅ 已完成
+2. Salience 排序（情感权重 × 时间衰减）
+3. Dream cycle 简化版（4 阶段：lint→embed--stale→extract--all→generate stale synthesis）
+4. links schema 扩展（加 `chunk_id` 列支持真正独立的多条 evidence link）
