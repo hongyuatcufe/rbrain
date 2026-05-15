@@ -785,11 +785,25 @@ impl Engine {
         }
 
         // Run full hybrid search with extra headroom, then filter
-        let ranked = if expand {
+        let mut ranked = if expand {
             self.expanded_search(query, lang, k * 5).await?
         } else {
             self.hybrid_search(query, lang, k * 5).await?
         };
+
+        // Also run keyword search with the type/tag filter directly, to guarantee
+        // that filtered pages aren't crowded out of the global hybrid ranking by
+        // many high-scoring pages of other types.
+        let filtered_kw = self.keyword_search_filtered(query, lang, k * 5, page_type, tag).await?;
+        if !filtered_kw.is_empty() {
+            let existing_ids: HashSet<i64> = ranked.iter().map(|(id, _)| *id).collect();
+            for (id, score) in filtered_kw {
+                if !existing_ids.contains(&id) {
+                    ranked.push((id, score as f64));
+                }
+            }
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
 
         let ids: Vec<i64> = ranked.iter().map(|(id, _)| *id).collect();
         if ids.is_empty() {
