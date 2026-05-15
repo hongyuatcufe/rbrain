@@ -1,219 +1,130 @@
-# rbrain Development Progress
+# rbrain 开发进展
 
-## Phase Status
+## 项目概述
 
-| Phase | Description | Status |
-|-------|-------------|--------|
-| 1 | Core schema + CRUD (put/get/delete/list) | ✅ Complete |
-| 2 | Bulk import + file-system sync | ✅ Complete |
-| 3 | Text chunking + embedding (Qwen API) | ✅ Complete |
-| 4 | Hybrid search (usearch HNSW + tantivy BM25 + RRF) | ✅ Complete |
-| 5 | CJK morphological tokenization (lindera) | ✅ Complete |
-| 6 | Knowledge graph (links/backlinks/traverse) | ✅ Complete |
-| 7 | Wiki generation (`rbrain generate` + `brain_generate`) | ✅ Complete |
-| 8 | MCP server (stdio + HTTP, 9 tools) | ✅ Complete |
-| 9 | Background job queue (`rbrain-worker`) | ✅ Complete |
-| 10 | Project-local brain (`.rbrain/` git-style discovery) | ✅ Complete |
+rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面向学术研究的个人 AI 知识库 CLI。
 
 ---
 
-## Implemented Features (Detail)
+## 当前状态（2026-05-15）
 
-### Data Layer
-- [x] SQLite in WAL mode, single source of truth
-- [x] Pages table: slug, title, page_type, tags, compiled_truth, timeline, language
-- [x] Chunks table: page_slug, chunk_index, text, embedding (BLOB), lang
-- [x] Links table: source_slug, target_slug, edge_type, context
-- [x] Jobs table: type, payload, status, result, error, timestamps
-- [x] Auto-migration on first open
-
-### Search
-- [x] Vector search via usearch HNSW (`rbrain-search/src/vector_store.rs`)
-- [x] Keyword search via tantivy BM25 (`rbrain-search/src/keyword_index.rs`)
-- [x] CJK pre-segmentation with lindera (IPADIC/CC-CEDICT/ko-dic)
-- [x] Chinese Traditional→Simplified normalization (ferrous-opencc)
-- [x] RRF fusion (`rbrain-engine/src/engine.rs`)
-- [x] LLM query expansion via DeepSeek (`expand=true`)
-- [x] Backlink boost in hybrid ranking
-- [x] Search results with chunk text (`search_with_context`)
-- [x] Grouped output in CLI (`print_grouped_results`)
-
-### Embedding
-- [x] Qwen text-embedding-v4 (1024-dim, strong CJK)
-- [x] Batch embedding with retry
-- [x] MockEmbedder for offline testing (`--mock-embed`)
-- [x] `rbrain put` auto re-embeds after save
-
-### Knowledge Graph
-- [x] `[[wikilink]]` extraction from Markdown
-- [x] `rbrain extract --all` builds graph edges
-- [x] `rbrain graph-query <slug> --depth --direction`
-- [x] `rbrain backlinks <slug>`
-- [x] MCP `brain_graph` + `brain_backlinks` tools
-
-### Wiki Generation
-- [x] DeepSeek chat client (`from_config` reads API key)
-- [x] `rbrain generate <topic> [--save] [--expand]`
-- [x] MCP `brain_generate` tool
-
-### MCP Server (9 tools)
-- [x] `brain_query` — hybrid search with RRF
-- [x] `brain_get` — fetch full page
-- [x] `brain_put` — create/update page
-- [x] `brain_delete` — delete page + chunks
-- [x] `brain_list` — list with type/tag filter
-- [x] `brain_graph` — knowledge graph traversal
-- [x] `brain_backlinks` — find incoming links
-- [x] `brain_stats` — knowledge base statistics
-- [x] `brain_generate` — search + LLM → wiki
-
-### Infrastructure
-- [x] Project-local brain: git-style walk-up finds `.rbrain/`
-- [x] `rbrain init` creates `.rbrain/` + updates `.gitignore`
-- [x] Global fallback: `~/.rbrain/`
-- [x] Figment config (flat TOML + env var override)
-- [x] Background job queue (`rbrain-worker`, SQLite-backed)
-- [x] `rbrain doctor --fix` health check
-- [x] `rbrain stats` statistics
+| 功能领域 | 状态 |
+|---------|------|
+| 页面 CRUD（put/get/delete/list） | ✅ 完成 |
+| Bulk import（import_dir） | ✅ 完成 |
+| CJK 分词 keyword search（Tantivy + lindera） | ✅ 完成 |
+| Hybrid search（向量 + BM25 + RRF） | ✅ 完成 |
+| Graph links（link/backlinks/links/graph-query/orphans） | ✅ 完成 |
+| Chunk 锚定 evidence link（--from-chunk） | ✅ 完成 |
+| Timeline / Take / Think | ✅ 完成 |
+| Tag 管理（tag/untag/tags） | ✅ 完成 |
+| Lint / Export / embed --stale | ✅ 完成 |
+| MCP server（brain_query/link/unlink/orphans） | ✅ 完成 |
+| Claude Code slash command（/rbrain, /rbrain-edu） | ✅ 完成 |
+| --mock-embed 全局标志 | ✅ 完成 |
+| Embed 进度条（indicatif） | ⬜ 待做 |
+| Salience / Anomalies / Dream cycle | ⬜ 待做 |
 
 ---
 
-## Pending Items
+## 提交历史
 
-### Item 6 — `rbrain get` truncated output (Easy)
+### Commit 5（本次）— Phase 2 Easy batch + bug fixes
+**日期**: 2026-05-15
 
-**Problem**: `rbrain get <slug>` currently dumps the full page content, which is unwieldy for large pages (books, long notes).
+**新增命令**:
+- `rbrain links <slug>` — 查出链（与 backlinks 对称），显示 edge type + evidence context
+- `rbrain tag/untag/tags <slug> [tag]` — 标签管理
+- `rbrain export --dir <path> --format md|json` — 导出所有页面
+- `rbrain lint` — 质量检查：缺 title、未嵌入页、孤立页、broken links
+- `rbrain embed --stale` — 只重嵌未嵌入/过时的页面
+- `rbrain sync --embed` — sync + 自动 re-embed 改动页面
 
-**Design**:
-- Default: truncate at 2000 chars, print `… (use --full to see complete content)`
-- `--full` flag: print everything
-- Optional `--lines N` for custom limit
+**Bug 修复**:
+1. `add_timeline_entry` / `add_take` 调用 `put_page` 会清空 explicit links → 改为直接 SQL UPDATE，links 不受影响
+2. `put` 命令不解析 frontmatter，导致 type/title/tags 丢失 → 先调 `MarkdownParser::parse()` 再建 page
+3. `add_link` 对同一 (source, target, type) 的第二次调用会覆盖 context → 改为追加（多段原文用 `---` 分隔）
+4. `rbrain backlinks` 空结果静默 → 现在明确提示 `(none)`
 
-**Files**: `crates/rbrain-cli/src/main.rs` (Get command, ~5 lines change)
+**新增 engine 方法**:
+- `outlinks(slug)` — 查出链
+- `add_tag(slug, tag)` / `remove_tag(slug, tag)` / `list_stale_pages()` — 标签和 stale 管理
+- `lint()` — 返回 (level, slug, message) 警告列表
+- `export_pages(dir, json)` — 批量导出
 
-**Effort**: ~30 min
-
----
-
-### Item 7 — Embed progress bar (Medium)
-
-**Problem**: `rbrain embed --all` shows `[1/N]` prefix but no percentage, ETA, or visual bar. For large corpora (1000+ chunks) it feels stuck.
-
-**Design**:
-- Use [`indicatif`](https://crates.io/crates/indicatif) crate
-- Progress bar format: `[===>    ] 3/10 pages  42/137 chunks  ETA 00:23`
-- Two-level progress: outer bar for pages, inner spinner for current-page chunks
-- Suppress bar when stdout is not a TTY (e.g., CI / piped output)
-
-**Files**:
-- `Cargo.toml` workspace deps: add `indicatif = "0.17"`
-- `crates/rbrain-cli/src/main.rs`: `embed` command wrapper
-- `crates/rbrain-engine/src/engine.rs`: `embed_all()` yield progress via callback or channel
-
-**Effort**: ~2 hrs
+**Skill 重构**:
+- `~/.claude/commands/rbrain.md` → 通用版（领域无关示例，标准路径 notes/concepts/questions/）
+- `~/.claude/commands/rbrain-edu.md` → 新建，教育史专用（中文示例，research/figures/periods/ 路径）
 
 ---
 
-### Item 8 — `rbrain sync` auto re-embed changed pages (Medium)
+### Commit 4 — Timeline, Take, Think + chunk 锚定 evidence
+**日期**: 2026-05-14/15
 
-**Problem**: `rbrain sync` detects new/changed/deleted files and updates SQLite, but does **not** re-embed the changed pages. The user must run `rbrain embed --all` manually afterward.
-
-**Design**:
-1. `sync` command: after DB update, collect `changed_slugs` and `new_slugs`
-2. If `--embed` flag passed (or auto-detect): call `engine.chunk_and_embed_page()` for each changed slug
-3. Log: `Synced 3 pages: 2 embedded, 1 skipped (no embedder)`
-
-**Files**:
-- `crates/rbrain-engine/src/engine.rs`: `sync_dir()` returns `SyncResult { added, changed, deleted }`
-- `crates/rbrain-cli/src/main.rs`: `sync` command handles `--embed` flag
-
-**Consideration**: Large repos may have many changed files. Add `--embed` as opt-in flag rather than default to avoid accidental API overuse.
-
-**Effort**: ~3 hrs
+- `rbrain timeline/take/takes/think` CLI 命令
+- `rbrain link --from-chunk <id>` — 自动从 chunk 读取 context 作为 evidence
+- search/query 输出显示 `[chunk:ID]`
+- MCP: brain_link（含 chunk_id）、brain_unlink、brain_orphans
+- `~/.claude/commands/rbrain.md` slash command 创建
 
 ---
 
-### Item 9 — Dream Cycle (Complex)
+### Commit 3 — Bug fixes（集成测试发现）
+**日期**: 2026-05-14
 
-**Problem**: gbrain has a `dream` / `synthesize` flow (see `gbrain/src/synthesize.ts`) that autonomously:
-1. Picks underlinked wiki topics from the graph
-2. Runs `brain_query` to gather evidence
-3. Calls LLM to synthesise a wiki page
-4. Saves the result and repeats with new topics discovered in the generated text
-
-This creates a self-improving knowledge base over time.
-
-**Design for rbrain**:
-
-```
-rbrain dream [--cycles N] [--topic <seed>] [--dry-run]
-```
-
-**Architecture** (multi-step agentic loop):
-
-```
-Dream loop iteration:
-  1. Pick topic
-     - If --topic given: use it for first cycle, then extract [[links]] from generated pages
-     - Otherwise: pick least-connected page from graph (graph_density outlier)
-  2. Gather evidence
-     - engine.search_with_context(topic, lang, k=15, expand=true)
-  3. Synthesise
-     - deepseek.chat(DREAM_SYSTEM_PROMPT, context + topic)
-     - Parse generated [[wikilinks]] to discover next topics
-  4. Save + extract links
-     - engine.put_page(wiki_page)
-     - engine.extract_links(&wiki_page)  → queue newly mentioned topics
-  5. Continue
-     - Add newly discovered topics to a priority queue (BFS/BFS)
-     - Repeat until N cycles done or queue empty
-```
-
-**System prompt** (`DREAM_SYSTEM_PROMPT`):
-```
-You are a scholarly wiki editor for an academic knowledge base on education history.
-Given the retrieved source materials, write a concise Markdown wiki page.
-- Use [[wikilink]] syntax to link related concepts
-- Cite sources as (slug)
-- Keep to 400-800 words
-- Language: match the source materials
-```
-
-**Job queue integration**:
-- Each cycle is a `DreamJob` submitted to `rbrain-worker`
-- `rbrain dream --background` submits a batch and returns immediately
-- `rbrain jobs` shows progress
-
-**Files**:
-- `crates/rbrain-engine/src/engine.rs`: `dream_cycle()` method
-- `crates/rbrain-cli/src/main.rs`: `Dream` command
-- `crates/rbrain-worker/src/jobs.rs`: `DreamJob` handler
-- New: `crates/rbrain-engine/src/dream.rs` (dream loop logic)
-
-**Reference**: `gbrain/src/synthesize.ts`, `gbrain/src/brain.ts` (`minion_dream` subagent)
-
-**Effort**: ~2–3 days (design + implementation + testing)
+- `import_dir` 只调 put_page，忘了调 chunk_and_embed → 修复
+- `add_link` INSERT 缺 created_at → 修复
+- indegree trigger COUNT(*) 无 GROUP BY 返回 NULL → 修复（migration 0007）
+- wikilink 提取把图片（.jpeg/.png）当页面链接 → 过滤掉
+- import slug 有尾随空格 → `.trim()`
 
 ---
 
-## Known Limitations / Tech Debt
+### Commit 2 — Link, Unlink, Orphans
+**日期**: 2026-05-14
 
-| Issue | Impact | Fix |
-|-------|--------|-----|
-| Tantivy index rebuilt on schema change | Lose keyword index on upgrade | Add schema version check + rebuild prompt |
-| No authentication on HTTP MCP server | Local use only; not safe to expose | Add Bearer token or OAuth 2.1 |
-| `rbrain serve supervisor` not fully tested | Background worker untested E2E | Add integration test |
-| lindera dictionary size | Adds ~50 MB to binary | Feature-flag per language |
-| No pagination on `rbrain list` | Large brains return all pages | Add `--limit` + `--offset` |
+- `rbrain link/unlink/orphans` CLI
+- Graph query 支持 depth + direction
+- Backlinks 显示 context
 
 ---
 
-## Roadmap Summary
+### Commit 1 — Initial release v0.1.0
+**日期**: 2026-05-14
 
-```
-Done  ████████████████████  Phase 1-10
-Next  ░░░░░░░░░░░░░░░░░░░░  Item 6 (get truncate) — 30 min
-      ░░░░░░░░░░░░░░░░░░░░  Item 7 (progress bar) — 2 hrs
-      ░░░░░░░░░░░░░░░░░░░░  Item 8 (sync embed)   — 3 hrs
-      ░░░░░░░░░░░░░░░░░░░░  Item 9 (dream cycle)  — 3 days
-```
+- 8 个 crate 架构
+- 核心 CRUD、import、embed、keyword search、hybrid search
+- Tantivy lazy writer（Option<IndexWriter>，按需创建，commit 后释放锁）
+- lindera CJK 预分词（zh/ja/ko）
+- MockEmbedder（--mock-embed 全局标志）
+- MCP server（stdio + HTTP）
+- Job queue + Worker
+
+---
+
+## 已知限制
+
+1. **links 唯一约束**：`UNIQUE(source_slug, target_slug, edge_type)` — 同一本书同类型 link 已改为 context 追加，但仍是一行记录。如需完全独立的多条 link，需迁移 schema 加 `chunk_id` 列。
+
+2. **embed 进度条**：`embed --all` 只打印行文本，无 indicatif 进度条。
+
+3. **sync --embed 不自动触发**：sync 发现改动后需要手动加 `--embed` 标志才会 re-embed。
+
+4. **Dream cycle**：自动维护（lint→embed→extract→synthesize）尚未实现。
+
+---
+
+## API Keys
+
+- DeepSeek: `deepseek.api_key` in `~/.rbrain/config.toml`（用于 generate/think/query expand）
+- DashScope Qwen: `qwen.api_key`（用于 embedding，中国区 endpoint）
+- `--mock-embed` 全局标志：完全离线测试，无需任何 key
+
+---
+
+## 下一步（按优先级）
+
+1. embed 进度条（indicatif，~1h）
+2. `rbrain doctor` 增强（embedding 覆盖率、最大 indegree、tantivy index 大小）
+3. Salience 排序（情感权重 × 时间衰减）
+4. Dream cycle 简化版（4 阶段：lint→embed--stale→extract--all→generate stale synthesis）
