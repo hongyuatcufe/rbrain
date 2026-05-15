@@ -87,6 +87,28 @@ pub struct BacklinksArgs {
     pub slug: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct LinkArgs {
+    /// Source page slug (the page making the claim or reference)
+    pub from: String,
+    /// Target page slug (the source being cited or related page)
+    pub to: String,
+    /// Relationship type: evidence, related, person, period, supports, contrasts, develops, mentions, references
+    pub link_type: Option<String>,
+    /// Chunk ID from brain_query results — auto-captures that passage as evidence context
+    pub chunk_id: Option<i64>,
+    /// Free-text context note (used when chunk_id is not provided)
+    pub context: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct UnlinkArgs {
+    pub from: String,
+    pub to: String,
+    /// Remove only links of this type (omit to remove all types between these pages)
+    pub link_type: Option<String>,
+}
+
 // ── Result types ────────────────────────────────────────────────────────────
 
 #[derive(Serialize, JsonSchema)]
@@ -412,6 +434,71 @@ impl RBrainMcpServer {
                     saved_as: None,
                 })
             }
+        }
+    }
+
+    /// Add a typed link between two pages, optionally anchored to a specific chunk as evidence.
+    #[tool(
+        name = "brain_link",
+        description = "Create a typed directed link between two pages. \
+            Use chunk_id (from brain_query results) to anchor the link to a specific passage as evidence — \
+            the chunk text is automatically captured as context. \
+            link_type: evidence | related | person | period | supports | contrasts | develops | mentions | references"
+    )]
+    async fn link(&self, Parameters(args): Parameters<LinkArgs>) -> Json<MutationResult> {
+        let link_type = args.link_type.as_deref().unwrap_or("related");
+
+        // Resolve context from chunk_id if provided
+        let context: Option<String> = if let Some(chunk_id) = args.chunk_id {
+            match self.engine.fetch_chunk_by_id(chunk_id).await {
+                Ok(Some((text, _page_slug))) => Some(text),
+                Ok(None) => {
+                    return Json(MutationResult::err(format!(
+                        "Chunk {} not found. Use chunk_id from brain_query results.", chunk_id
+                    )));
+                }
+                Err(e) => {
+                    return Json(MutationResult::err(format!("Failed to fetch chunk: {}", e)));
+                }
+            }
+        } else {
+            args.context.clone()
+        };
+
+        match self.engine.add_link(&args.from, &args.to, link_type, context.as_deref()).await {
+            Ok(_) => Json(MutationResult::ok(format!(
+                "Link added: {} --[{}]--> {}{}",
+                args.from, link_type, args.to,
+                if args.chunk_id.is_some() { format!(" (context from chunk:{})", args.chunk_id.unwrap()) } else { String::new() }
+            ))),
+            Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
+        }
+    }
+
+    /// Remove a link between two pages.
+    #[tool(
+        name = "brain_unlink",
+        description = "Remove a typed link between two pages. \
+            Specify link_type to remove only that type; omit to remove all links between these pages."
+    )]
+    async fn unlink(&self, Parameters(args): Parameters<UnlinkArgs>) -> Json<MutationResult> {
+        match self.engine.remove_link(&args.from, &args.to, args.link_type.as_deref()).await {
+            Ok(n) if n > 0 => Json(MutationResult::ok(format!("Removed {} link(s): {} --> {}", n, args.from, args.to))),
+            Ok(_) => Json(MutationResult::err(format!("No matching link found: {} --> {}", args.from, args.to))),
+            Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
+        }
+    }
+
+    /// List pages with no incoming links (orphan pages).
+    #[tool(
+        name = "brain_orphans",
+        description = "Find pages that have no incoming links — not referenced by any other page. \
+            Use to discover isolated knowledge that needs to be connected to the graph."
+    )]
+    async fn orphans(&self) -> Json<Vec<String>> {
+        match self.engine.orphan_pages().await {
+            Ok(slugs) => Json(slugs),
+            Err(_) => Json(vec![]),
         }
     }
 }

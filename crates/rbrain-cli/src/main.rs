@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use rbrain_core::config::Config;
 use rbrain_core::embedder::Embedder;
+use rbrain_core::markdown::MarkdownParser;
 use rbrain_core::page::Page;
 use rbrain_engine::{Engine, extract_links};
 use rbrain_llm::mock::MockEmbedder;
@@ -98,7 +99,10 @@ enum Commands {
         /// Link type: evidence, related, person, period, supports, contrasts, develops, mentions, references (default: related)
         #[arg(long, default_value = "related")]
         r#type: String,
-        /// Optional context note explaining the link
+        /// Capture a specific chunk as evidence context (use chunk_id shown in search/query output)
+        #[arg(long, value_name = "CHUNK_ID")]
+        from_chunk: Option<i64>,
+        /// Optional free-text context note (overridden by --from-chunk if both given)
         #[arg(long)]
         context: Option<String>,
     },
@@ -407,11 +411,38 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Link { from, to, r#type, context } => {
+        Commands::Link { from, to, r#type, from_chunk, context } => {
             let config = Config::load()?;
             let engine = Engine::open(config.clone()).await?;
-            engine.add_link(&from, &to, &r#type, context.as_deref()).await?;
-            println!("Link added: {} --[{}]--> {}", from, r#type, to);
+
+            // Resolve context: chunk text takes precedence over free-text --context
+            let resolved_context: Option<String> = if let Some(chunk_id) = from_chunk {
+                match engine.fetch_chunk_by_id(chunk_id).await? {
+                    Some((text, page_slug)) => {
+                        // Verify the chunk belongs to the target page
+                        let norm_to = MarkdownParser::normalize_slug(&to);
+                        if page_slug != norm_to {
+                            eprintln!(
+                                "Warning: chunk {} belongs to '{}', not '{}'. Proceeding anyway.",
+                                chunk_id, page_slug, to
+                            );
+                        }
+                        Some(text)
+                    }
+                    None => {
+                        anyhow::bail!("Chunk {} not found. Run `rbrain search` or `rbrain query` to see chunk IDs.", chunk_id);
+                    }
+                }
+            } else {
+                context
+            };
+
+            engine.add_link(&from, &to, &r#type, resolved_context.as_deref()).await?;
+            if from_chunk.is_some() {
+                println!("Link added: {} --[{}]--> {} (context from chunk:{})", from, r#type, to, from_chunk.unwrap());
+            } else {
+                println!("Link added: {} --[{}]--> {}", from, r#type, to);
+            }
         }
         Commands::Unlink { from, to, r#type } => {
             let config = Config::load()?;
@@ -737,7 +768,7 @@ fn print_grouped_results(query: &str, chunks: &[rbrain_engine::ChunkResult], pag
             "[{}] {} — {} chunk{} (best score={:.4})",
             rank + 1, slug, n, if n == 1 { "" } else { "s" }, best_score
         );
-        // Show up to 2 chunk previews per page
+        // Show up to 2 chunk previews per page with chunk_id for evidence linking
         for chunk in page_chunks.iter().take(2) {
             let preview: String = chunk.text.chars().take(180).collect();
             let preview = if chunk.text.chars().count() > 180 {
@@ -745,10 +776,10 @@ fn print_grouped_results(query: &str, chunks: &[rbrain_engine::ChunkResult], pag
             } else {
                 preview
             };
-            println!("    ↳ {}", preview);
+            println!("    ↳ [chunk:{}] {}", chunk.chunk_id, preview);
         }
         if n > 2 {
-            println!("    ↳ … ({} more chunks)", n - 2);
+            println!("    ↳ … ({} more chunks, use --show-chunks to list all)", n - 2);
         }
         println!();
     }

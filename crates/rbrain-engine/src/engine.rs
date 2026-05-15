@@ -994,6 +994,16 @@ impl Engine {
             .collect())
     }
 
+    /// Fetch a single chunk by id. Returns (text, page_slug) or None if not found.
+    pub async fn fetch_chunk_by_id(&self, chunk_id: i64) -> Result<Option<(String, String)>> {
+        let row = sqlx::query("SELECT text, page_slug FROM chunks WHERE id = ?1")
+            .bind(chunk_id)
+            .fetch_optional(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        Ok(row.map(|r| (r.get::<String, _>("text"), r.get::<String, _>("page_slug"))))
+    }
+
     /// Hybrid search returning ranked chunks with full text context.
     pub async fn search_with_context(
         &self,
