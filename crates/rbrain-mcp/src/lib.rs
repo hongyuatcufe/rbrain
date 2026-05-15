@@ -109,6 +109,42 @@ pub struct UnlinkArgs {
     pub link_type: Option<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct ThinkArgs {
+    /// Topic to reason about
+    pub topic: String,
+    /// Number of context chunks (default 12, max 20)
+    pub limit: Option<i32>,
+    /// Use LLM query expansion for better recall (default false)
+    pub expand: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct TimelineArgs {
+    /// Page slug to append the timeline entry to
+    pub slug: String,
+    /// Text description of the event or finding
+    pub text: String,
+    /// Date in YYYY-MM-DD format (default: today)
+    pub date: Option<String>,
+    /// Source reference (e.g. "book-slug chunk:150")
+    pub source: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct TagArgs {
+    /// Page slug
+    pub slug: String,
+    /// Tag to add or remove
+    pub tag: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct OutlinksArgs {
+    /// Source page slug — find all pages this page links to
+    pub slug: String,
+}
+
 // ── Result types ────────────────────────────────────────────────────────────
 
 #[derive(Serialize, JsonSchema)]
@@ -498,6 +534,102 @@ impl RBrainMcpServer {
     async fn orphans(&self) -> Json<Vec<String>> {
         match self.engine.orphan_pages().await {
             Ok(slugs) => Json(slugs),
+            Err(_) => Json(vec![]),
+        }
+    }
+
+    /// Deep reasoning synthesis on a topic.
+    #[tool(
+        name = "brain_think",
+        description = "Search the knowledge base for relevant chunks and run structured deep reasoning: \
+            core claims, tensions & contradictions, working judgment, open questions. \
+            Returns a Markdown reasoning artifact with inline citations. Requires deepseek.api_key."
+    )]
+    async fn think(&self, Parameters(args): Parameters<ThinkArgs>) -> Json<String> {
+        let lang = detect_lang(&args.topic);
+        let limit = args.limit.map(|l| l.clamp(1, 20) as usize).unwrap_or(12);
+        let expand = args.expand.unwrap_or(false);
+        match self.engine.think(&args.topic, &lang, limit, expand).await {
+            Ok(result) => Json(result),
+            Err(e) => Json(format!("Error: {}", e)),
+        }
+    }
+
+    /// Append a dated entry to a page's timeline.
+    #[tool(
+        name = "brain_add_timeline_entry",
+        description = "Append a dated event or finding to a page's timeline log. \
+            Use this to record when a scholar is mentioned, a claim is encountered, or a source is read. \
+            date defaults to today (YYYY-MM-DD) if omitted."
+    )]
+    async fn add_timeline_entry(
+        &self,
+        Parameters(args): Parameters<TimelineArgs>,
+    ) -> Json<MutationResult> {
+        let date = args
+            .date
+            .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+        match self
+            .engine
+            .add_timeline_entry(&args.slug, &date, &args.text, args.source.as_deref())
+            .await
+        {
+            Ok(_) => Json(MutationResult::ok(format!(
+                "Timeline entry added to '{}'",
+                args.slug
+            ))),
+            Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
+        }
+    }
+
+    /// Add a tag to a page.
+    #[tool(
+        name = "brain_add_tag",
+        description = "Add a tag to a page. Tags enable filtering with brain_list and brain_query."
+    )]
+    async fn add_tag(&self, Parameters(args): Parameters<TagArgs>) -> Json<MutationResult> {
+        match self.engine.add_tag(&args.slug, &args.tag).await {
+            Ok(_) => Json(MutationResult::ok(format!(
+                "Tag '{}' added to '{}'",
+                args.tag, args.slug
+            ))),
+            Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
+        }
+    }
+
+    /// Remove a tag from a page.
+    #[tool(
+        name = "brain_remove_tag",
+        description = "Remove a tag from a page."
+    )]
+    async fn remove_tag(&self, Parameters(args): Parameters<TagArgs>) -> Json<MutationResult> {
+        match self.engine.remove_tag(&args.slug, &args.tag).await {
+            Ok(_) => Json(MutationResult::ok(format!(
+                "Tag '{}' removed from '{}'",
+                args.tag, args.slug
+            ))),
+            Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
+        }
+    }
+
+    /// Find all pages this page links to (outgoing links).
+    #[tool(
+        name = "brain_outlinks",
+        description = "Find all pages that this page links to (outgoing links). \
+            Complement to brain_backlinks. Shows what a page references or cites."
+    )]
+    async fn outlinks(&self, Parameters(args): Parameters<OutlinksArgs>) -> Json<Vec<LinkRef>> {
+        match self.engine.outlinks(&args.slug).await {
+            Ok(links) => Json(
+                links
+                    .into_iter()
+                    .map(|l| LinkRef {
+                        source_slug: l.target_slug,
+                        edge_type: l.edge_type,
+                        context: l.context,
+                    })
+                    .collect(),
+            ),
             Err(_) => Json(vec![]),
         }
     }

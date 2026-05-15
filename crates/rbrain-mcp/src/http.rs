@@ -257,6 +257,74 @@ async fn call_tool(
 
             Ok(serde_json::to_string_pretty(&stats).unwrap_or_default())
         }
+        "brain_think" => {
+            let topic = arguments.get("topic")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let limit = arguments.get("limit")
+                .and_then(|v| v.as_i64())
+                .map(|l| l.max(1).min(20) as usize)
+                .unwrap_or(12);
+            let expand = arguments.get("expand")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let lang = match whatlang::detect(&topic).map(|i| i.lang()) {
+                Some(whatlang::Lang::Jpn) => rbrain_core::page::Language::Ja,
+                Some(whatlang::Lang::Kor) => rbrain_core::page::Language::Ko,
+                Some(whatlang::Lang::Cmn) => rbrain_core::page::Language::ZhHans,
+                _ => rbrain_core::page::Language::En,
+            };
+            engine.think(&topic, &lang, limit, expand).await
+                .map_err(|e| (-32000, format!("Think failed: {}", e)))
+        }
+        "brain_add_timeline_entry" => {
+            let slug = arguments.get("slug")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let text = arguments.get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let date = arguments.get("date")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+            let source = arguments.get("source")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            engine.add_timeline_entry(&slug, &date, &text, source.as_deref()).await
+                .map(|_| format!("Timeline entry added to '{}'", slug))
+                .map_err(|e| (-32000, format!("Failed: {}", e)))
+        }
+        "brain_add_tag" => {
+            let slug = arguments.get("slug").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let tag = arguments.get("tag").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            engine.add_tag(&slug, &tag).await
+                .map(|_| format!("Tag '{}' added to '{}'", tag, slug))
+                .map_err(|e| (-32000, format!("Failed: {}", e)))
+        }
+        "brain_remove_tag" => {
+            let slug = arguments.get("slug").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let tag = arguments.get("tag").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            engine.remove_tag(&slug, &tag).await
+                .map(|_| format!("Tag '{}' removed from '{}'", tag, slug))
+                .map_err(|e| (-32000, format!("Failed: {}", e)))
+        }
+        "brain_outlinks" => {
+            let slug = arguments.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+            let links = engine.outlinks(slug).await
+                .map_err(|e| (-32000, format!("Failed: {}", e)))?;
+            let results: Vec<_> = links.into_iter()
+                .map(|l| json!({
+                    "target_slug": l.target_slug,
+                    "edge_type": l.edge_type,
+                    "context": l.context,
+                }))
+                .collect();
+            Ok(serde_json::to_string_pretty(&results).unwrap_or_default())
+        }
         _ => Err((-32601, format!("Unknown tool: {}", name))),
     }
 }
@@ -412,6 +480,68 @@ async fn list_tools() -> impl IntoResponse {
                 "type": "object",
                 "properties": {},
                 "required": []
+            }
+        },
+        {
+            "name": "brain_think",
+            "description": "Search the knowledge base and run structured deep reasoning: core claims, tensions, working judgment, open questions. Returns a Markdown artifact with inline citations.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": { "type": "string", "description": "Topic to reason about" },
+                    "limit": { "type": "integer", "description": "Number of context chunks (default 12)" },
+                    "expand": { "type": "boolean", "description": "Use LLM query expansion (default false)" }
+                },
+                "required": ["topic"]
+            }
+        },
+        {
+            "name": "brain_add_timeline_entry",
+            "description": "Append a dated event or finding to a page's timeline log.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string", "description": "Page slug" },
+                    "text": { "type": "string", "description": "Event description" },
+                    "date": { "type": "string", "description": "Date in YYYY-MM-DD (default: today)" },
+                    "source": { "type": "string", "description": "Source reference e.g. 'book-slug chunk:150'" }
+                },
+                "required": ["slug", "text"]
+            }
+        },
+        {
+            "name": "brain_add_tag",
+            "description": "Add a tag to a page.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string" },
+                    "tag": { "type": "string" }
+                },
+                "required": ["slug", "tag"]
+            }
+        },
+        {
+            "name": "brain_remove_tag",
+            "description": "Remove a tag from a page.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string" },
+                    "tag": { "type": "string" }
+                },
+                "required": ["slug", "tag"]
+            }
+        },
+        {
+            "name": "brain_outlinks",
+            "description": "Find all pages this page links to (outgoing links). Complement to brain_backlinks.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string", "description": "Source page slug" }
+                },
+                "required": ["slug"]
             }
         }
     ]);

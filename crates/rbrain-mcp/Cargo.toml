@@ -16,6 +16,7 @@ async-trait = { workspace = true }
 axum = { workspace = true }
 anyhow = { workspace = true }
 whatlang = { workspace = true }
+chrono = { workspace = true }
 
 [lints]
 workspace = true
