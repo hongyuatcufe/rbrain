@@ -22,6 +22,10 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 | MCP server（brain_query/link/unlink/orphans） | ✅ 完成 |
 | Claude Code slash command（/rbrain, /rbrain-edu） | ✅ 完成 |
 | --mock-embed 全局标志 | ✅ 完成 |
+| search/query --type/--tag 过滤 | ✅ 完成 |
+| graph-query depth-1 context 显示 | ✅ 完成 |
+| links 多段 evidence 展示（passages） | ✅ 完成 |
+| think 多语言 prompt（CJK/EN） | ✅ 完成 |
 | Embed 进度条（indicatif） | ⬜ 待做 |
 | Salience / Anomalies / Dream cycle | ⬜ 待做 |
 
@@ -29,7 +33,39 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 
 ## 提交历史
 
-### Commit 5（本次）— Phase 2 Easy batch + bug fixes
+### Commit 7 — query --type/--tag crowding-out bug fix
+**日期**: 2026-05-15
+
+**问题**: `query "因材施教" --type concept --limit 3` 返回空结果，`--limit 5` 才有结果。
+
+**根因**: `search_with_context_filtered` 先跑全局 hybrid search 取 top-k 候选，再用 SQL 过滤类型。当 brain 里书籍 chunk 数量多、BM25 分值高时，concept chunk（分值 7.2）会被 45 个更高分的 book chunk 挤出 top-k 候选池，SQL 过滤阶段找不到它。
+
+**修复**: `search_with_context_filtered` 额外跑一次 `keyword_search_filtered(page_type, tag)`，把过滤后命中的 chunk 合并进候选池，确保目标类型的页面始终参与 SQL 过滤。
+
+---
+
+### Commit 6 — 研究工作流核心缺口修复
+**日期**: 2026-05-15
+
+**Fix 1 — search/query --type/--tag 过滤**:
+- `search "孔子" --type book` 只返回书籍，不污染自写的 concept/note 结果
+- `query "因材施教" --type concept` 返回概念页（见 Commit 7 的 crowding-out 修复）
+
+**Fix 2 — --from-chunk 存储带 chunk ID 前缀**:
+- 新 evidence link 存储格式：`[chunk:59755] 孔子的因材施教原则...`
+- `rbrain links` 多段展示：`Context (3 passages): [1] ... [2] ... [3] ...`
+
+**Fix 3 — graph-query depth-1 显示 context**:
+- `rbrain graph-query <slug> --depth 1` 每条 depth-1 边显示 evidence 摘要
+- 修复 SQL 混用 `?1` 和 `?` 导致 sqlx 绑定错位的 bug
+
+**Fix 4 — think 多语言 prompt**:
+- CJK 语料：中文推理 prompt（核心观点 / 张力与矛盾 / 工作判断 / 开放问题）
+- 英文语料：English prompt（Core Claims / Tensions & Gaps / Working Judgment / Open Questions）
+
+---
+
+### Commit 5 — Phase 2 Easy batch + bug fixes
 **日期**: 2026-05-15
 
 **新增命令**:
@@ -104,11 +140,11 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 
 ## 已知限制
 
-1. **links 唯一约束**：`UNIQUE(source_slug, target_slug, edge_type)` — 同一本书同类型 link 已改为 context 追加，但仍是一行记录。如需完全独立的多条 link，需迁移 schema 加 `chunk_id` 列。
+1. **links 唯一约束**：`UNIQUE(source_slug, target_slug, edge_type)` — 同一本书同类型 link 已改为 context 追加（`---` 分隔），仍是一行记录。如需完全独立的多条 link，需迁移 schema 加 `chunk_id` 列。
 
-2. **embed 进度条**：`embed --all` 只打印行文本，无 indicatif 进度条。
+2. **旧 evidence context 无 chunk ID 前缀**：Commit 6 之前通过 `--from-chunk` 存储的 context 没有 `[chunk:ID]` 前缀，新增的才有。
 
-3. **sync --embed 不自动触发**：sync 发现改动后需要手动加 `--embed` 标志才会 re-embed。
+3. **embed 进度条**：`embed --all` 只打印行文本，无 indicatif 进度条。
 
 4. **Dream cycle**：自动维护（lint→embed→extract→synthesize）尚未实现。
 
