@@ -649,6 +649,7 @@ impl Engine {
                 .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
             let slug = relative.to_string_lossy()
                 .trim_end_matches(".md")
+                .trim()
                 .replace(std::path::MAIN_SEPARATOR, "/");
             let normalized = MarkdownParser::normalize_slug(&slug);
 
@@ -683,7 +684,12 @@ impl Engine {
             let full_text = format!("{} {}", page.compiled_truth, page.timeline);
             page.language = Self::detect_language(&full_text);
 
-            self.put_page(page).await?;
+            self.put_page(page.clone()).await?;
+            if self.has_embedder() {
+                if let Err(e) = self.chunk_and_embed_page(&page).await {
+                    tracing::warn!("embed failed for {}: {}", page.slug, e);
+                }
+            }
             imported.push(slug);
         }
 
@@ -1059,8 +1065,8 @@ impl Engine {
         let source = MarkdownParser::normalize_slug(source_slug);
         let target = MarkdownParser::normalize_slug(target_slug);
         sqlx::query(
-            "INSERT OR REPLACE INTO links (source_slug, target_slug, edge_type, context) \
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR REPLACE INTO links (source_slug, target_slug, edge_type, context, created_at) \
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
         )
         .bind(&source)
         .bind(&target)

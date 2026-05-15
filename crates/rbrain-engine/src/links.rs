@@ -15,7 +15,11 @@ pub fn extract_links(content: &str) -> Vec<LinkRef> {
 
     let wiki_re = Regex::new(r"\[\[([^\]]+)\]\]").unwrap();
     for cap in wiki_re.captures_iter(&text) {
-        let slug = cap[1].to_string();
+        let slug = cap[1].trim().to_string();
+        // Skip image/attachment links
+        if is_media_file(&slug) {
+            continue;
+        }
         let sentence = get_sentence_containing(&text, cap.get(0).unwrap().start());
         let edge_type = infer_edge_type(&sentence);
         refs.push(LinkRef {
@@ -32,7 +36,11 @@ pub fn extract_links(content: &str) -> Vec<LinkRef> {
             let slug = url
                 .trim_start_matches("./")
                 .trim_end_matches(".md")
+                .trim()
                 .to_string();
+            if is_media_file(&slug) {
+                continue;
+            }
             let sentence = get_sentence_containing(&text, cap.get(0).unwrap().start());
             let edge_type = infer_edge_type(&sentence);
             refs.push(LinkRef {
@@ -44,6 +52,15 @@ pub fn extract_links(content: &str) -> Vec<LinkRef> {
     }
 
     refs
+}
+
+fn is_media_file(slug: &str) -> bool {
+    let lower = slug.to_lowercase();
+    matches!(
+        lower.rsplit('.').next().unwrap_or(""),
+        "jpeg" | "jpg" | "png" | "gif" | "webp" | "svg" | "pdf" | "mp4" | "mp3" | "wav"
+            | "zip" | "tar" | "gz" | "xlsx" | "docx" | "pptx"
+    )
 }
 
 fn infer_edge_type(sentence: &str) -> String {

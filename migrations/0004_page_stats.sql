@@ -8,13 +8,12 @@ CREATE TABLE IF NOT EXISTS page_stats (
 CREATE TRIGGER IF NOT EXISTS update_indegree_insert AFTER INSERT ON links
 BEGIN
     INSERT OR IGNORE INTO page_stats (slug, indegree)
-    SELECT p.slug, COUNT(*) 
-    FROM pages p 
-    JOIN links l ON p.slug = l.target_slug 
-    WHERE l.target_slug = NEW.target_slug;
-    
-    UPDATE page_stats 
-    SET indegree = (SELECT COUNT(*) FROM links WHERE target_slug = slug) 
+    SELECT NEW.target_slug, 0
+    FROM pages
+    WHERE slug = NEW.target_slug;
+
+    UPDATE page_stats
+    SET indegree = (SELECT COUNT(*) FROM links WHERE target_slug = NEW.target_slug)
     WHERE slug = NEW.target_slug;
 END;
 
