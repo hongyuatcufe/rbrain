@@ -124,21 +124,33 @@ impl Config {
         // RBRAIN_HOME overrides all path derivations (highest priority, gbrain-style).
         if let Ok(home_path) = std::env::var("RBRAIN_HOME") {
             let local_dir = PathBuf::from(&home_path);
-            let project_dir = local_dir.parent().unwrap_or(&local_dir).to_path_buf();
+            let (project_dir, data_dir) = Self::resolve_dirs(&local_dir);
             let path_overrides = serde_json::json!({
                 "repo_dir":        project_dir,
-                "data_dir":        local_dir,
-                "db_path":         local_dir.join("brain.db"),
-                "vectors_path":    local_dir.join("vectors.usearch"),
-                "tantivy_dir":     local_dir.join("tantivy"),
-                "dictionaries_dir": local_dir.join("dictionaries"),
+                "data_dir":        data_dir,
+                "db_path":         data_dir.join("brain.db"),
+                "vectors_path":    data_dir.join("vectors.usearch"),
+                "tantivy_dir":     data_dir.join("tantivy"),
+                "dictionaries_dir": data_dir.join("dictionaries"),
             });
             fig = fig
                 .merge(Serialized::globals(path_overrides))
-                .merge(Toml::file(local_dir.join("config.toml")));
+                .merge(Toml::file(data_dir.join("config.toml")));
         }
 
         fig.merge(Env::prefixed("RBRAIN_").global()).extract()
+    }
+
+    /// If the given path is named `.rbrain`, treat its parent as the repo root.
+    /// Otherwise treat the path itself as both repo root and data dir.
+    fn resolve_dirs(brain_dir: &PathBuf) -> (PathBuf, PathBuf) {
+        if brain_dir.file_name().map_or(false, |n| n == ".rbrain") {
+            let project_dir = brain_dir.parent().unwrap_or(brain_dir).to_path_buf();
+            (project_dir, brain_dir.clone())
+        } else {
+            // brain_dir IS the content directory; store db/index inside it
+            (brain_dir.clone(), brain_dir.clone())
+        }
     }
 
     /// Load with an explicit brain directory override (from --brain-dir CLI flag).
@@ -149,22 +161,22 @@ impl Config {
         let home = home::home_dir().expect("HOME not set");
         let global_config = home.join(".rbrain").join("config.toml");
         let local_dir = brain_dir.to_path_buf();
-        let project_dir = local_dir.parent().unwrap_or(brain_dir).to_path_buf();
+        let (project_dir, data_dir) = Self::resolve_dirs(&local_dir);
 
         let path_overrides = serde_json::json!({
             "repo_dir":        project_dir,
-            "data_dir":        local_dir,
-            "db_path":         local_dir.join("brain.db"),
-            "vectors_path":    local_dir.join("vectors.usearch"),
-            "tantivy_dir":     local_dir.join("tantivy"),
-            "dictionaries_dir": local_dir.join("dictionaries"),
+            "data_dir":        data_dir,
+            "db_path":         data_dir.join("brain.db"),
+            "vectors_path":    data_dir.join("vectors.usearch"),
+            "tantivy_dir":     data_dir.join("tantivy"),
+            "dictionaries_dir": data_dir.join("dictionaries"),
         });
 
         Figment::new()
             .merge(Serialized::defaults(Config::default()))
             .merge(Toml::file(&global_config))
             .merge(Serialized::globals(path_overrides))
-            .merge(Toml::file(local_dir.join("config.toml")))
+            .merge(Toml::file(data_dir.join("config.toml")))
             .merge(Env::prefixed("RBRAIN_").global())
             .extract()
     }

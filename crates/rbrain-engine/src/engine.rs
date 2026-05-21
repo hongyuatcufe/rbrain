@@ -96,13 +96,21 @@ impl Engine {
     }
 
     pub async fn put_page(&self, page: Page) -> Result<()> {
+        self.put_page_inner(page, false).await
+    }
+
+    pub async fn put_page_force(&self, page: Page) -> Result<()> {
+        self.put_page_inner(page, true).await
+    }
+
+    async fn put_page_inner(&self, page: Page, force: bool) -> Result<()> {
         let repo_path = self
             .inner
             .config
             .repo_dir
             .join(format!("{}.md", page.slug));
 
-        if repo_path.exists() {
+        if !force && repo_path.exists() {
             let existing_content = std::fs::read_to_string(&repo_path)?;
             let existing_hash = MarkdownParser::content_hash(&existing_content);
 
@@ -174,8 +182,8 @@ impl Engine {
         for link in links {
             sqlx::query(
                 "INSERT OR IGNORE INTO links \
-                 (source_slug, target_slug, edge_type, context, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                 (source_slug, target_slug, edge_type, context, created_at, chunk_id) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), -1)",
             )
             .bind(&normalized_slug)
             .bind(&link.target_slug)
@@ -233,6 +241,28 @@ impl Engine {
                 message: "Keyword index not configured".to_string(),
             }
         })?;
+
+        // Remove old chunk vectors before deleting DB records (IDs are lost after DELETE).
+        let old_chunk_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM chunks WHERE page_slug = ?1"
+        )
+        .bind(&page.slug)
+        .fetch_all(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        if !old_chunk_ids.is_empty() {
+            if let Some(vs) = &self.inner.vector_store {
+                for id in &old_chunk_ids {
+                    let _ = vs.delete(*id).await;
+                }
+            }
+            if let Some(ki) = &self.inner.keyword_index {
+                for id in &old_chunk_ids {
+                    let _ = ki.delete(*id).await;
+                }
+            }
+        }
 
         sqlx::query("DELETE FROM chunks WHERE page_slug = ?1")
             .bind(&page.slug)
@@ -404,21 +434,16 @@ impl Engine {
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        if let Some(vector_store) = &self.inner.vector_store {
-            for chunk_id in &chunk_ids {
-                vector_store.delete(*chunk_id).await?;
-            }
-            vector_store.save().await?;
-        }
-
-        if let Some(keyword_index) = &self.inner.keyword_index {
-            for chunk_id in &chunk_ids {
-                keyword_index.delete(*chunk_id).await?;
-            }
-            keyword_index.commit().await?;
-        }
-
+        // Delete from DB first — if index cleanup fails, the page is gone from DB
+        // (clean state). Stale index entries are harmless: searches hit the DB to
+        // verify existence and will skip them.
         sqlx::query("DELETE FROM chunks WHERE page_slug = ?1")
+            .bind(&normalized)
+            .execute(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        sqlx::query("DELETE FROM links WHERE source_slug = ?1 OR target_slug = ?1")
             .bind(&normalized)
             .execute(&self.inner.db)
             .await
@@ -434,6 +459,20 @@ impl Engine {
             std::fs::remove_file(&repo_path)?;
         }
 
+        if let Some(vector_store) = &self.inner.vector_store {
+            for chunk_id in &chunk_ids {
+                let _ = vector_store.delete(*chunk_id).await;
+            }
+            let _ = vector_store.save().await;
+        }
+
+        if let Some(keyword_index) = &self.inner.keyword_index {
+            for chunk_id in &chunk_ids {
+                let _ = keyword_index.delete(*chunk_id).await;
+            }
+            let _ = keyword_index.commit().await;
+        }
+
         Ok(())
     }
 
@@ -442,29 +481,37 @@ impl Engine {
         page_type: Option<&str>,
         tag: Option<&str>,
     ) -> Result<Vec<Page>> {
-        let mut query = String::from(
-            "SELECT slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, created_at, updated_at FROM pages",
-        );
-        let mut conditions = Vec::new();
+        const BASE: &str = "SELECT slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, created_at, updated_at FROM pages";
 
-        if let Some(t) = page_type {
-            conditions.push(format!("page_type = '{}'", t.replace('\'', "''")));
+        let rows = match (page_type, tag) {
+            (Some(pt), Some(tg)) => {
+                let tag_pattern = format!("%{}%", tg);
+                sqlx::query(&format!("{} WHERE page_type = ?1 AND tags LIKE ?2 ORDER BY updated_at DESC", BASE))
+                    .bind(pt)
+                    .bind(tag_pattern)
+                    .fetch_all(&self.inner.db)
+                    .await
+            }
+            (Some(pt), None) => {
+                sqlx::query(&format!("{} WHERE page_type = ?1 ORDER BY updated_at DESC", BASE))
+                    .bind(pt)
+                    .fetch_all(&self.inner.db)
+                    .await
+            }
+            (None, Some(tg)) => {
+                let tag_pattern = format!("%{}%", tg);
+                sqlx::query(&format!("{} WHERE tags LIKE ?1 ORDER BY updated_at DESC", BASE))
+                    .bind(tag_pattern)
+                    .fetch_all(&self.inner.db)
+                    .await
+            }
+            (None, None) => {
+                sqlx::query(&format!("{} ORDER BY updated_at DESC", BASE))
+                    .fetch_all(&self.inner.db)
+                    .await
+            }
         }
-        if let Some(t) = tag {
-            conditions.push(format!("tags LIKE '%{}%'", t.replace('\'', "''")));
-        }
-
-        if !conditions.is_empty() {
-            query.push_str(" WHERE ");
-            query.push_str(&conditions.join(" AND "));
-        }
-
-        query.push_str(" ORDER BY updated_at DESC");
-
-        let rows = sqlx::query(&query)
-            .fetch_all(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let mut pages = Vec::new();
         for row in rows {
@@ -549,6 +596,17 @@ impl Engine {
 
         for entry in WalkDir::new(repo_dir)
             .into_iter()
+            .filter_entry(|e| {
+                // Skip hidden directories and common non-content directories
+                let name = e.file_name().to_string_lossy();
+                if e.file_type().is_dir() {
+                    !name.starts_with('.') && name != "node_modules" && name != "__pycache__"
+                        && name != "target" && name != "dist" && name != "build"
+                        && !name.ends_with(".dist-info") && !name.ends_with(".data")
+                } else {
+                    true
+                }
+            })
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
         {
@@ -575,40 +633,12 @@ impl Engine {
                     db_slug_set.remove(&slug);
                 }
                 Some(_) => {
-                    let parse_result = MarkdownParser::parse(&content);
-                    let mut page = Page::new(
-                        MarkdownParser::normalize_slug(&slug),
-                        parse_result.frontmatter.get("type").and_then(|v| v.as_str()).unwrap_or("note").to_string(),
-                        parse_result.compiled_truth.clone(),
-                    );
-                    page.timeline = parse_result.timeline;
-                    page.frontmatter = parse_result.frontmatter;
-                    if let Some(t) = page.frontmatter.get("title").and_then(|v| v.as_str()) {
-                        page.title = t.to_string();
-                    }
-                    if let Some(tags_val) = page.frontmatter.get("tags").and_then(|v| v.as_array()) {
-                        page.tags = tags_val.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
-                    }
-                    self.put_page(page).await?;
+                    self.sync_file_to_db(&slug, &content, &hash).await?;
                     updated.push(slug.clone());
                     db_slug_set.remove(&slug);
                 }
                 None => {
-                    let parse_result = MarkdownParser::parse(&content);
-                    let mut page = Page::new(
-                        MarkdownParser::normalize_slug(&slug),
-                        parse_result.frontmatter.get("type").and_then(|v| v.as_str()).unwrap_or("note").to_string(),
-                        parse_result.compiled_truth.clone(),
-                    );
-                    page.timeline = parse_result.timeline;
-                    page.frontmatter = parse_result.frontmatter;
-                    if let Some(t) = page.frontmatter.get("title").and_then(|v| v.as_str()) {
-                        page.title = t.to_string();
-                    }
-                    if let Some(tags_val) = page.frontmatter.get("tags").and_then(|v| v.as_array()) {
-                        page.tags = tags_val.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
-                    }
-                    self.put_page(page).await?;
+                    self.sync_file_to_db(&slug, &content, &hash).await?;
                     imported.push(slug.clone());
                     db_slug_set.remove(&slug);
                 }
@@ -620,6 +650,88 @@ impl Engine {
         }
 
         Ok((imported, updated, orphaned))
+    }
+
+    /// Update the DB record for a file that was edited externally, without
+    /// rewriting the file on disk. The raw file body is stored as compiled_truth
+    /// so that hand-written markdown (including `---` horizontal rules) is preserved.
+    async fn sync_file_to_db(&self, slug: &str, content: &str, hash: &str) -> Result<()> {
+        let parse_result = MarkdownParser::parse(content);
+        let fm = &parse_result.frontmatter;
+        let page_type = fm.get("type").and_then(|v| v.as_str()).unwrap_or("note").to_string();
+        let title = fm.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let tags: Vec<String> = fm.get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+        let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
+        let language = Some(rbrain_core::page::Language::detect(&parse_result.compiled_truth).to_string());
+        let normalized_slug = MarkdownParser::normalize_slug(slug);
+        let frontmatter_json = serde_json::to_string(fm).unwrap_or_else(|_| "{}".to_string());
+
+        // Store the full body (pre-split) so `---` horizontal rules in hand-written
+        // markdown are not lost. compiled_truth holds the verbatim body text.
+        let body_start = {
+            let mut pos = 0;
+            let bytes = content.as_bytes();
+            if content.starts_with("---") {
+                pos = 3;
+                while pos < bytes.len() {
+                    if bytes[pos] == b'\n' && content[pos+1..].starts_with("---") {
+                        pos += 4;
+                        while pos < bytes.len() && bytes[pos] != b'\n' { pos += 1; }
+                        if pos < bytes.len() { pos += 1; }
+                        break;
+                    }
+                    pos += 1;
+                }
+            }
+            pos
+        };
+        let raw_body = content[body_start..].trim().to_string();
+
+        sqlx::query(
+            "INSERT OR REPLACE INTO pages \
+             (slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7, ?8, \
+                     COALESCE((SELECT created_at FROM pages WHERE slug = ?1), datetime('now')), \
+                     datetime('now'))",
+        )
+        .bind(&normalized_slug)
+        .bind(&page_type)
+        .bind(&title)
+        .bind(&tags_json)
+        .bind(&frontmatter_json)
+        .bind(&raw_body)
+        .bind(&language)
+        .bind(hash)
+        .execute(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        sqlx::query("DELETE FROM links WHERE source_slug = ?1")
+            .bind(&normalized_slug)
+            .execute(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        let links = extract_links(&raw_body);
+        for link in links {
+            sqlx::query(
+                "INSERT OR IGNORE INTO links \
+                 (source_slug, target_slug, edge_type, context, created_at, chunk_id) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), -1)",
+            )
+            .bind(&normalized_slug)
+            .bind(&link.target_slug)
+            .bind(&link.edge_type)
+            .bind(&link.context)
+            .execute(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        }
+
+        Ok(())
     }
 
     pub async fn import_dir(&self, dir: &str) -> Result<Vec<String>> {
@@ -636,6 +748,16 @@ impl Engine {
 
         for entry in WalkDir::new(dir)
             .into_iter()
+            .filter_entry(|e| {
+                let name = e.file_name().to_string_lossy();
+                if e.file_type().is_dir() {
+                    !name.starts_with('.') && name != "node_modules" && name != "__pycache__"
+                        && name != "target" && name != "dist" && name != "build"
+                        && !name.ends_with(".dist-info") && !name.ends_with(".data")
+                } else {
+                    true
+                }
+            })
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
         {
@@ -1414,6 +1536,16 @@ impl Engine {
             format!("{}\n{}", entry, page.timeline)
         };
 
+        // Write file first; only update DB after filesystem succeeds.
+        let repo_path = self.inner.config.repo_dir.join(format!("{}.md", normalized));
+        let new_hash = if repo_path.exists() {
+            let canonical = MarkdownParser::to_canonical(&page.frontmatter, &page.compiled_truth, &new_timeline);
+            std::fs::write(&repo_path, &canonical)?;
+            Some(MarkdownParser::content_hash(&canonical))
+        } else {
+            None
+        };
+
         sqlx::query(
             "UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2"
         )
@@ -1423,14 +1555,9 @@ impl Engine {
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        // Mirror to filesystem
-        let repo_path = self.inner.config.repo_dir.join(format!("{}.md", normalized));
-        if repo_path.exists() {
-            let canonical = MarkdownParser::to_canonical(&page.frontmatter, &page.compiled_truth, &new_timeline);
-            std::fs::write(&repo_path, &canonical)?;
-            let new_hash = MarkdownParser::content_hash(&canonical);
+        if let Some(hash) = new_hash {
             sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
-                .bind(&new_hash)
+                .bind(&hash)
                 .bind(&normalized)
                 .execute(&self.inner.db)
                 .await
@@ -1888,27 +2015,7 @@ impl Engine {
         let mut page = self.get_page(slug).await?;
         if !page.tags.contains(&tag.to_string()) {
             page.tags.push(tag.to_string());
-            let tags_json = serde_json::to_string(&page.tags)?;
-            sqlx::query("UPDATE pages SET tags = ?1, updated_at = datetime('now') WHERE slug = ?2")
-                .bind(&tags_json)
-                .bind(&page.slug)
-                .execute(&self.inner.db)
-                .await
-                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-            let repo_path = self.inner.config.repo_dir.join(format!("{}.md", page.slug));
-            if repo_path.exists() {
-                let content = std::fs::read_to_string(&repo_path)?;
-                let updated = update_frontmatter_tags(&content, &page.tags);
-                std::fs::write(&repo_path, updated)?;
-                let new_hash = MarkdownParser::content_hash(&std::fs::read_to_string(&repo_path)?);
-                sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
-                    .bind(&new_hash)
-                    .bind(&page.slug)
-                    .execute(&self.inner.db)
-                    .await
-                    .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-            }
+            self.write_tags_to_file_and_db(&page).await?;
         }
         Ok(())
     }
@@ -1919,27 +2026,39 @@ impl Engine {
         let before = page.tags.len();
         page.tags.retain(|t| t != tag);
         if page.tags.len() != before {
-            let tags_json = serde_json::to_string(&page.tags)?;
-            sqlx::query("UPDATE pages SET tags = ?1, updated_at = datetime('now') WHERE slug = ?2")
-                .bind(&tags_json)
+            self.write_tags_to_file_and_db(&page).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_tags_to_file_and_db(&self, page: &Page) -> Result<()> {
+        let tags_json = serde_json::to_string(&page.tags)?;
+        // Write file first; only update DB after filesystem succeeds.
+        let repo_path = self.inner.config.repo_dir.join(format!("{}.md", page.slug));
+        let new_hash = if repo_path.exists() {
+            let content = std::fs::read_to_string(&repo_path)?;
+            let updated = update_frontmatter_tags(&content, &page.tags);
+            let hash = MarkdownParser::content_hash(&updated);
+            std::fs::write(&repo_path, updated)?;
+            Some(hash)
+        } else {
+            None
+        };
+
+        sqlx::query("UPDATE pages SET tags = ?1, updated_at = datetime('now') WHERE slug = ?2")
+            .bind(&tags_json)
+            .bind(&page.slug)
+            .execute(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        if let Some(hash) = new_hash {
+            sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
+                .bind(&hash)
                 .bind(&page.slug)
                 .execute(&self.inner.db)
                 .await
                 .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-            let repo_path = self.inner.config.repo_dir.join(format!("{}.md", page.slug));
-            if repo_path.exists() {
-                let content = std::fs::read_to_string(&repo_path)?;
-                let updated = update_frontmatter_tags(&content, &page.tags);
-                std::fs::write(&repo_path, updated)?;
-                let new_hash = MarkdownParser::content_hash(&std::fs::read_to_string(&repo_path)?);
-                sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
-                    .bind(&new_hash)
-                    .bind(&page.slug)
-                    .execute(&self.inner.db)
-                    .await
-                    .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-            }
         }
         Ok(())
     }

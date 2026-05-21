@@ -104,13 +104,13 @@ fn get_sentence_containing(text: &str, pos: usize) -> String {
     let after = &text[pos..];
 
     let start = before
-        .rfind(|c| c == '。' || c == '！' || c == '？' || c == '.' || c == '!' || c == '?' || c == '\n')
-        .map(|i| i + 1)
+        .rfind(|c: char| c == '。' || c == '！' || c == '？' || c == '.' || c == '!' || c == '?' || c == '\n')
+        .map(|i| i + before[i..].chars().next().map_or(1, |c| c.len_utf8()))
         .unwrap_or(0);
 
     let end = after
-        .find(|c| c == '。' || c == '！' || c == '？' || c == '.' || c == '!' || c == '?' || c == '\n')
-        .map(|i| pos + i + 1)
+        .find(|c: char| c == '。' || c == '！' || c == '？' || c == '.' || c == '!' || c == '?' || c == '\n')
+        .map(|i| pos + i + after[i..].chars().next().map_or(1, |c| c.len_utf8()))
         .unwrap_or(text.len());
 
     text[start..end].trim().to_string()

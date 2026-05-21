@@ -320,6 +320,34 @@ async fn call_tool(
                 .collect();
             Ok(serde_json::to_string_pretty(&results).unwrap_or_default())
         }
+        "brain_delete" => {
+            let slug = arguments.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+            engine.delete_page(slug).await
+                .map(|_| format!("Page '{}' deleted", slug))
+                .map_err(|e| (-32000, format!("Failed: {}", e)))
+        }
+        "brain_link" => {
+            let from = arguments.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let to = arguments.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let link_type = arguments.get("link_type").and_then(|v| v.as_str()).unwrap_or("related").to_string();
+            let context = arguments.get("context").and_then(|v| v.as_str()).map(|s| s.to_string());
+            engine.add_link(&from, &to, &link_type, context.as_deref()).await
+                .map(|_| format!("Link created: {} --[{}]--> {}", from, link_type, to))
+                .map_err(|e| (-32000, format!("Failed: {}", e)))
+        }
+        "brain_unlink" => {
+            let from = arguments.get("from").and_then(|v| v.as_str()).unwrap_or("");
+            let to = arguments.get("to").and_then(|v| v.as_str()).unwrap_or("");
+            let link_type = arguments.get("link_type").and_then(|v| v.as_str());
+            engine.remove_link(from, to, link_type).await
+                .map(|n| format!("Removed {} link(s)", n))
+                .map_err(|e| (-32000, format!("Failed: {}", e)))
+        }
+        "brain_orphans" => {
+            let slugs = engine.orphan_pages().await
+                .map_err(|e| (-32000, format!("Failed: {}", e)))?;
+            Ok(serde_json::to_string_pretty(&slugs).unwrap_or_default())
+        }
         _ => Err((-32601, format!("Unknown tool: {}", name))),
     }
 }

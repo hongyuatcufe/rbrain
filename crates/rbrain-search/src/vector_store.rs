@@ -48,13 +48,18 @@ impl UsearchStore {
 impl VectorStore for UsearchStore {
     async fn upsert(&self, chunk_id: i64, embedding: &[f32]) -> Result<()> {
         let idx = self.index.lock().unwrap();
+        let key = chunk_id as u64;
+        // Remove existing entry first so this is a true upsert (multi: false forbids duplicates).
+        if idx.size() > 0 {
+            let _ = idx.remove(key);
+        }
         if idx.size() >= idx.capacity() {
             let reserve_to = (idx.capacity() + 256).next_power_of_two();
             idx.reserve(reserve_to).map_err(|e| rbrain_core::error::BrainError::Io(
                 std::io::Error::new(std::io::ErrorKind::Other, format!("usearch reserve: {}", e))
             ))?;
         }
-        idx.add(chunk_id as u64, embedding).map_err(|e| rbrain_core::error::BrainError::Io(
+        idx.add(key, embedding).map_err(|e| rbrain_core::error::BrainError::Io(
             std::io::Error::new(std::io::ErrorKind::Other, format!("usearch add: {}", e))
         ))?;
         Ok(())
@@ -65,7 +70,13 @@ impl VectorStore for UsearchStore {
             return Ok(());
         }
         let idx = self.index.lock().unwrap();
-        // Ensure there is enough capacity for the whole batch before inserting.
+        // Remove existing entries first (true upsert — multi: false forbids duplicates).
+        if idx.size() > 0 {
+            for (id, _) in items {
+                let _ = idx.remove(*id as u64);
+            }
+        }
+        // Capacity check: size may have shrunk after removes, but reserve for the full batch.
         let needed = idx.size() + items.len();
         if needed > idx.capacity() {
             let reserve_to = (needed + 256).next_power_of_two();
