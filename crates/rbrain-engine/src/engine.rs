@@ -1944,7 +1944,8 @@ impl Engine {
         let stale_slugs: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT page_slug FROM chunks WHERE has_embedding = 0 OR indexed_in_vectors = 0
              UNION
-             SELECT slug FROM pages WHERE slug NOT IN (SELECT DISTINCT page_slug FROM chunks)"
+             SELECT slug FROM pages
+             WHERE slug NOT IN (SELECT DISTINCT page_slug FROM chunks WHERE page_slug IS NOT NULL)"
         )
         .fetch_all(&self.inner.db)
         .await

@@ -39,7 +39,7 @@ enum Commands {
         r#type: Option<String>,
         #[arg(long, help = "Read content from file instead of stdin")]
         file: Option<String>,
-        #[arg(long, help = "Page content as a string (alternative to stdin/--file)")]
+        #[arg(long, help = "Page content as a string (alternative to stdin/--file)", allow_hyphen_values = true)]
         content: Option<String>,
     },
     /// Retrieve a page by slug and print its content
@@ -790,8 +790,15 @@ async fn main() -> anyhow::Result<()> {
             if save {
                 let slug = topic.to_lowercase().replace(' ', "-").replace(['/', '\\', '.'], "-");
                 let page = Page::new(slug.clone(), "wiki".to_string(), wiki);
-                engine.put_page(page).await?;
+                engine.put_page(page.clone()).await?;
                 eprintln!("\nSaved as wiki page: {}", slug);
+                if engine.has_embedder() {
+                    eprint!("Embedding… ");
+                    match engine.chunk_and_embed_page(&page).await {
+                        Ok(_) => eprintln!("done."),
+                        Err(e) => eprintln!("warning: embed failed ({}). Run `rbrain embed {}` manually.", e, slug),
+                    }
+                }
             }
         }
         Commands::Timeline { slug, date, text, source } => {
@@ -843,8 +850,15 @@ async fn main() -> anyhow::Result<()> {
                     topic.to_lowercase().replace(' ', "-").replace(['/', '\\', '.'], "-")
                 );
                 let page = Page::new(slug.clone(), "synthesis".to_string(), reasoning);
-                engine.put_page(page).await?;
+                engine.put_page(page.clone()).await?;
                 eprintln!("\nSaved as synthesis page: {}", slug);
+                if engine.has_embedder() {
+                    eprint!("Embedding… ");
+                    match engine.chunk_and_embed_page(&page).await {
+                        Ok(_) => eprintln!("done."),
+                        Err(e) => eprintln!("warning: embed failed ({}). Run `rbrain embed {}` manually.", e, slug),
+                    }
+                }
             }
         }
         Commands::Tag { slug, tag } => {
