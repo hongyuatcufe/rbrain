@@ -121,7 +121,52 @@ impl Config {
                 .merge(Toml::file(local_dir.join("config.toml")));
         }
 
+        // RBRAIN_HOME overrides all path derivations (highest priority, gbrain-style).
+        if let Ok(home_path) = std::env::var("RBRAIN_HOME") {
+            let local_dir = PathBuf::from(&home_path);
+            let project_dir = local_dir.parent().unwrap_or(&local_dir).to_path_buf();
+            let path_overrides = serde_json::json!({
+                "repo_dir":        project_dir,
+                "data_dir":        local_dir,
+                "db_path":         local_dir.join("brain.db"),
+                "vectors_path":    local_dir.join("vectors.usearch"),
+                "tantivy_dir":     local_dir.join("tantivy"),
+                "dictionaries_dir": local_dir.join("dictionaries"),
+            });
+            fig = fig
+                .merge(Serialized::globals(path_overrides))
+                .merge(Toml::file(local_dir.join("config.toml")));
+        }
+
         fig.merge(Env::prefixed("RBRAIN_").global()).extract()
+    }
+
+    /// Load with an explicit brain directory override (from --brain-dir CLI flag).
+    /// Equivalent to setting RBRAIN_HOME before calling load().
+    pub fn load_with_brain_dir(brain_dir: &std::path::Path) -> Result<Self, figment::Error> {
+        use figment::{Figment, providers::{Format, Toml, Env, Serialized}};
+
+        let home = home::home_dir().expect("HOME not set");
+        let global_config = home.join(".rbrain").join("config.toml");
+        let local_dir = brain_dir.to_path_buf();
+        let project_dir = local_dir.parent().unwrap_or(brain_dir).to_path_buf();
+
+        let path_overrides = serde_json::json!({
+            "repo_dir":        project_dir,
+            "data_dir":        local_dir,
+            "db_path":         local_dir.join("brain.db"),
+            "vectors_path":    local_dir.join("vectors.usearch"),
+            "tantivy_dir":     local_dir.join("tantivy"),
+            "dictionaries_dir": local_dir.join("dictionaries"),
+        });
+
+        Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::file(&global_config))
+            .merge(Serialized::globals(path_overrides))
+            .merge(Toml::file(local_dir.join("config.toml")))
+            .merge(Env::prefixed("RBRAIN_").global())
+            .extract()
     }
 
     /// Whether this config was resolved from a project-local `.rbrain/`.

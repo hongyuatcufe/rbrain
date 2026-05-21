@@ -14,10 +14,15 @@ use std::sync::Arc;
 #[derive(Parser)]
 #[command(name = "rbrain")]
 #[command(about = "Personal AI knowledge base")]
+#[command(version)]
 struct Cli {
     /// Use deterministic mock embedder (no API key needed, for testing)
     #[arg(long, global = true)]
     mock_embed: bool,
+
+    /// Path to the brain directory (e.g. /path/to/project/.rbrain). Equivalent to RBRAIN_HOME env var.
+    #[arg(long, global = true, value_name = "PATH")]
+    brain_dir: Option<std::path::PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -27,13 +32,15 @@ struct Cli {
 enum Commands {
     /// Initialise a project-local brain in the current directory (creates .rbrain/)
     Init,
-    /// Create or update a page (reads from stdin or --file; auto re-embeds on save)
+    /// Create or update a page (reads from --content, --file, or stdin; auto re-embeds on save)
     Put {
         slug: String,
         #[arg(long, help = "Page type: note, wiki, book, etc. (default: note)")]
         r#type: Option<String>,
         #[arg(long, help = "Read content from file instead of stdin")]
         file: Option<String>,
+        #[arg(long, help = "Page content as a string (alternative to stdin/--file)")]
+        content: Option<String>,
     },
     /// Retrieve a page by slug and print its content
     Get {
@@ -86,6 +93,20 @@ enum Commands {
         slug: String,
         #[arg(long, help = "Filter by edge type (e.g. references, mentions)")]
         edge_type: Option<String>,
+        #[arg(long, help = "Alias for --edge-type")]
+        r#type: Option<String>,
+        #[arg(long, default_value = "2", help = "Traversal depth (max 5)")]
+        depth: usize,
+        #[arg(long, default_value = "out", help = "Direction: out, in, or both")]
+        direction: String,
+    },
+    /// Alias for graph-query: traverse the knowledge graph from a page
+    Graph {
+        slug: String,
+        #[arg(long, help = "Filter by edge type (e.g. evidence, related)")]
+        edge_type: Option<String>,
+        #[arg(long, help = "Alias for --edge-type")]
+        r#type: Option<String>,
         #[arg(long, default_value = "2", help = "Traversal depth (max 5)")]
         depth: usize,
         #[arg(long, default_value = "out", help = "Direction: out, in, or both")]
@@ -221,8 +242,18 @@ enum Commands {
         #[arg(long, help = "Attempt to fix detected issues automatically")]
         fix: bool,
     },
+    /// Alias for doctor: run health checks
+    Health {
+        #[arg(long, help = "Attempt to fix detected issues automatically")]
+        fix: bool,
+    },
     /// Show brain statistics (pages, chunks, embedding coverage)
     Stats,
+    /// Show current configuration (API keys redacted)
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Job queue management (submit, list, get, cancel, work)
     Jobs {
         #[command(subcommand)]
@@ -274,6 +305,16 @@ enum ServeAction {
     },
 }
 
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Show all configuration values (API keys redacted)
+    Show,
+    /// Get a specific configuration value by key (e.g. models.think, deepseek.model)
+    Get {
+        key: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -283,6 +324,18 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let mock_embed = cli.mock_embed;
+    let brain_dir = cli.brain_dir;
+
+    // Helper macro so every command arm can call load_config!() without repetition.
+    macro_rules! load_config {
+        () => {
+            if let Some(ref bd) = brain_dir {
+                Config::load_with_brain_dir(bd)?
+            } else {
+                Config::load()?
+            }
+        };
+    }
 
     match cli.command {
         Commands::Init => {
@@ -295,7 +348,7 @@ async fn main() -> anyhow::Result<()> {
             // Add .rbrain/ to .gitignore so DB files are never committed.
             update_gitignore(&cwd)?;
 
-            let config = Config::load()?;
+            let config = load_config!();
             Engine::open(config.clone()).await?;
 
             if config.is_local() {
@@ -304,12 +357,14 @@ async fn main() -> anyhow::Result<()> {
                 println!("Brain initialised (global): {}", config.data_dir.display());
             }
         }
-        Commands::Put { slug, r#type, file } => {
-            let config = Config::load()?;
+        Commands::Put { slug, r#type, file, content: content_flag } => {
+            let config = load_config!();
             // Use search engine so we can re-embed after saving.
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
 
-            let content = if let Some(f) = file {
+            let content = if let Some(c) = content_flag {
+                c
+            } else if let Some(f) = file {
                 std::fs::read_to_string(f)?
             } else {
                 let mut buf = String::new();
@@ -357,7 +412,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Get { slug } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
 
             match engine.find_page_fuzzy(&slug).await {
@@ -384,13 +439,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Delete { slug } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             engine.delete_page(&slug).await?;
             println!("Page deleted");
         }
         Commands::List { r#type, tag, json, limit } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             let pages = engine.list_pages(r#type.as_deref(), tag.as_deref()).await?;
             let total = pages.len();
@@ -408,7 +463,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Import { dir, no_embed } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = if no_embed {
                 Engine::open(config.clone()).await?
             } else {
@@ -421,7 +476,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Sync { embed } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = if embed {
                 init_engine_with_search(config.clone(), mock_embed).await?
             } else {
@@ -451,7 +506,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Embed { slug, all, stale } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
 
             if stale {
@@ -524,7 +579,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Extract { slug, all } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
 
             if all {
@@ -554,18 +609,20 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("Either --all or a slug must be provided");
             }
         }
-        Commands::GraphQuery { slug, edge_type, depth, direction } => {
-            let config = Config::load()?;
+        Commands::GraphQuery { slug, edge_type, r#type, depth, direction }
+        | Commands::Graph { slug, edge_type, r#type, depth, direction } => {
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
-            let edges = engine.graph_query(&slug, edge_type.as_deref(), depth, &direction).await?;
+            // --type is an alias for --edge-type
+            let effective_edge_type = edge_type.or(r#type);
+            let edges = engine.graph_query(&slug, effective_edge_type.as_deref(), depth, &direction).await?;
             println!("Graph query for '{}' (depth={}, direction={}):", slug, depth, direction);
-            if let Some(et) = edge_type {
+            if let Some(ref et) = effective_edge_type {
                 println!("  Filtered by edge type: {}", et);
             }
             for edge in edges {
                 println!("  [{}] {} (depth={})", edge.edge_type, edge.target, edge.depth);
                 if let Some(ctx) = &edge.context {
-                    // Show first passage only (split on ---)
                     let first = ctx.split("\n\n---\n\n").next().unwrap_or(ctx);
                     let preview: String = first.chars().take(160).collect();
                     let preview = if first.chars().count() > 160 { format!("{}…", preview) } else { preview };
@@ -574,7 +631,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Backlinks { slug } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             let links = engine.backlinks(&slug).await?;
             println!("Backlinks to '{}':", slug);
@@ -589,7 +646,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Links { slug } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             let links = engine.outlinks(&slug).await?;
             println!("Links from '{}':", slug);
@@ -616,7 +673,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Link { from, to, r#type, from_chunk, context } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
 
             // Resolve context: chunk text takes precedence over free-text --context
@@ -649,7 +706,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Unlink { from, to, r#type } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             let removed = engine.remove_link(&from, &to, r#type.as_deref()).await?;
             if removed > 0 {
@@ -659,7 +716,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Orphans => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             let orphans = engine.orphan_pages().await?;
             if orphans.is_empty() {
@@ -672,7 +729,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Query { query, expand, limit, r#type, tag } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
             let lang = detect_lang(&query);
 
@@ -688,7 +745,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Search { query, limit, r#type, tag } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
             let lang = detect_lang(&query);
 
@@ -720,7 +777,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Generate { topic, limit, save, expand } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
             let lang = detect_lang(&topic);
 
@@ -738,7 +795,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Timeline { slug, date, text, source } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             let date_str = date.unwrap_or_else(|| {
                 chrono::Utc::now().format("%Y-%m-%d").to_string()
@@ -747,13 +804,13 @@ async fn main() -> anyhow::Result<()> {
             println!("Timeline entry added to '{}': {} — {}", slug, date_str, text);
         }
         Commands::Take { slug, content, kind } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             engine.add_take(&slug, &content, &kind).await?;
             println!("Take added to '{}' [{}]: {}", slug, kind, content);
         }
         Commands::Takes { slug } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             let page = engine.get_page(&slug).await?;
             let takes: Vec<&str> = page.timeline
@@ -770,7 +827,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Think { topic, limit, save, expand } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
             let lang = detect_lang(&topic);
 
@@ -791,19 +848,19 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Tag { slug, tag } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             engine.add_tag(&slug, &tag).await?;
             println!("Tag '{}' added to '{}'", tag, slug);
         }
         Commands::Untag { slug, tag } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             engine.remove_tag(&slug, &tag).await?;
             println!("Tag '{}' removed from '{}'", tag, slug);
         }
         Commands::Tags { slug } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             let page = engine.get_page(&slug).await?;
             if page.tags.is_empty() {
@@ -816,7 +873,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Export { dir, format } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             let json = format == "json";
             let out_dir = std::path::Path::new(&dir);
@@ -824,7 +881,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Exported {} pages to {} (format={})", count, dir, format);
         }
         Commands::Lint => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             let warnings = engine.lint().await?;
             if warnings.is_empty() {
@@ -840,8 +897,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Doctor { fix } => {
-            let config = Config::load()?;
+        Commands::Doctor { fix } | Commands::Health { fix } => {
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
 
             // ── Stats ────────────────────────────────────────────────────────
@@ -922,7 +979,7 @@ async fn main() -> anyhow::Result<()> {
             println!("═══════════════════════════════════════════════════════");
         }
         Commands::Stats => {
-            let config = Config::load()?;
+            let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             let stats = engine.get_stats().await?;
 
@@ -947,8 +1004,54 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Config { action } => {
+            let config = load_config!();
+            match action {
+                ConfigAction::Show => {
+                    println!("Brain path:       {}", config.data_dir.display());
+                    println!("Repo dir:         {}", config.repo_dir.display());
+                    println!("DB path:          {}", config.db_path.display());
+                    println!("Vectors path:     {}", config.vectors_path.display());
+                    println!("Tantivy dir:      {}", config.tantivy_dir.display());
+                    println!("Embedding dim:    {}", config.embedding_dim);
+                    println!("Log level:        {}", config.log_level);
+                    println!("\n[qwen]");
+                    println!("  base_url:       {}", config.qwen.base_url);
+                    println!("  model:          {}", config.qwen.model);
+                    let qwen_key = if config.qwen.api_key.is_empty() { "(not set)".to_string() } else { format!("{}…", &config.qwen.api_key[..config.qwen.api_key.len().min(8)]) };
+                    println!("  api_key:        {}", qwen_key);
+                    println!("\n[deepseek]");
+                    println!("  base_url:       {}", config.deepseek.base_url);
+                    println!("  model:          {}", config.deepseek.model);
+                    let ds_key = if config.deepseek.api_key.is_empty() { "(not set)".to_string() } else { format!("{}…", &config.deepseek.api_key[..config.deepseek.api_key.len().min(8)]) };
+                    println!("  api_key:        {}", ds_key);
+                }
+                ConfigAction::Get { key } => {
+                    let value = match key.as_str() {
+                        "data_dir" | "brain_dir" => config.data_dir.display().to_string(),
+                        "repo_dir" => config.repo_dir.display().to_string(),
+                        "db_path" => config.db_path.display().to_string(),
+                        "vectors_path" => config.vectors_path.display().to_string(),
+                        "tantivy_dir" => config.tantivy_dir.display().to_string(),
+                        "embedding_dim" => config.embedding_dim.to_string(),
+                        "log_level" => config.log_level.clone(),
+                        "qwen.base_url" | "models.embed" => config.qwen.base_url.clone(),
+                        "qwen.model" => config.qwen.model.clone(),
+                        "qwen.api_key" => "(redacted)".to_string(),
+                        "deepseek.base_url" => config.deepseek.base_url.clone(),
+                        "deepseek.model" | "models.think" | "models.default" => config.deepseek.model.clone(),
+                        "deepseek.api_key" => "(redacted)".to_string(),
+                        other => {
+                            eprintln!("Unknown config key: {}. Try `rbrain config show` to see available keys.", other);
+                            std::process::exit(1);
+                        }
+                    };
+                    println!("{}", value);
+                }
+            }
+        }
         Commands::Serve { action } => {
-            let config = Config::load()?;
+            let config = load_config!();
 
             match action {
                 ServeAction::Mcp { http } => {
@@ -994,7 +1097,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Jobs { action } => {
-            let config = Config::load()?;
+            let config = load_config!();
             let db = rbrain_db::open_database(&config.db_path).await?;
             let queue = Arc::new(rbrain_worker::JobQueue::new(db));
 

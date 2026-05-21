@@ -6,7 +6,7 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 
 ---
 
-## 当前状态（2026-05-15）
+## 当前状态（2026-05-21）
 
 | 功能领域 | 状态 |
 |---------|------|
@@ -29,11 +29,50 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 | think 多语言 prompt（CJK/EN） | ✅ 完成 |
 | Embed 进度条（indicatif） | ✅ 完成 |
 | Doctor 增强（embedding 覆盖率/indegree/存储大小） | ✅ 完成 |
+| RBRAIN_HOME 环境变量 + --brain-dir 全局标志 | ✅ 完成 |
+| rbrain put --content 内联写入 | ✅ 完成 |
+| rbrain config show / config get | ✅ 完成 |
+| rbrain health 别名（doctor） | ✅ 完成 |
+| rbrain graph 别名（graph-query） + --type 别名 | ✅ 完成 |
+| rbrain --version | ✅ 完成 |
+| rbrain-research-cli skill（parallel to gbrain skill） | ✅ 完成 |
+| MCP setup guide（Claude Code / Codex CLI / OpenCode） | ✅ 完成 |
 | Salience / Anomalies / Dream cycle | ⬜ 待做 |
 
 ---
 
 ## 提交历史
+
+### Commit 10 — gbrain-research-cli 功能对齐
+
+**日期**: 2026-05-21
+
+**背景**: 对照 `research-project-template/skills/gbrain-research-cli/SKILL.md` 进行功能审查，发现 rbrain CLI 在以下方面与 gbrain 存在差距，全部在本次 commit 补齐。
+
+**新增 CLI 功能**:
+
+| 功能 | 说明 |
+|------|------|
+| `RBRAIN_HOME=/path rbrain stats` | 环境变量设置 brain 路径，等价于 gbrain 的 `GBRAIN_HOME=` |
+| `rbrain --brain-dir /path stats` | 全局 CLI 标志，优先级高于 RBRAIN_HOME |
+| `rbrain put <slug> --content "..."` | 内联写入 Markdown，无需 stdin 或文件 |
+| `rbrain config show` | 显示当前配置（API key 脱敏） |
+| `rbrain config get <key>` | 获取单个配置项（支持 deepseek.model、qwen.model 等） |
+| `rbrain health [--fix]` | doctor 别名 |
+| `rbrain graph <slug> [--type <edge>] [--depth N]` | graph-query 别名，`--type` 是 `--edge-type` 的别名 |
+| `rbrain --version` / `rbrain -V` | 版本号 |
+
+**新增 skill 文件**:
+- `research-project-template/skills/rbrain-research-cli/SKILL.md` — 完整工作流文档
+- `research-project-template/skills/rbrain-research-cli/agents/openai.yaml` — Codex 接口定义
+- `research-project-template/skills/rbrain-research-cli/scripts/bootstrap-rbrain-cli.sh` — 安装脚本
+- `research-project-template/skills/rbrain-research-cli/references/project-profile-example.md` — 项目配置示例
+
+**核心文件改动**:
+- `crates/rbrain-core/src/config.rs` — 增加 `RBRAIN_HOME` 环境变量优先级处理；新增 `load_with_brain_dir()` 方法
+- `crates/rbrain-cli/src/main.rs` — 全局 `--brain-dir` 标志；`load_config!()` 宏统一配置加载；新增 `Put.content`、`Graph`、`Health`、`Config` subcommand 及 `ConfigAction`
+
+---
 
 ### Commit 9 — MCP output schema 修复
 
