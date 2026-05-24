@@ -83,7 +83,8 @@ SQLite is the **single source of truth**. Tantivy and usearch are derived indice
 | Query expansion (LLM) | ✅ | ✅ DeepSeek |
 | Backlink boost | ✅ | ✅ |
 | Knowledge graph (links / backlinks / traverse) | ✅ | ✅ |
-| Wiki generation (`generate`) | ✅ Dream cycle | ✅ `rbrain generate` |
+| Wiki generation (`generate`) | ✅ | ✅ `rbrain generate` |
+| Dream cycle (autonomous) | ✅ | ✅ `rbrain dream` |
 | MCP server (stdio) | ✅ | ✅ |
 | MCP server (HTTP) | ✅ OAuth 2.1 | ✅ (no auth yet) |
 | Background job queue | ✅ minions | ✅ rbrain-worker |
@@ -106,7 +107,7 @@ SQLite is the **single source of truth**. Tantivy and usearch are derived indice
 | `brain_stats` | Knowledge base statistics | `get_stats` | ✅ |
 | `brain_generate` | Search + LLM → wiki page | Dream cycle (subagent) | ✅ |
 | `submit_job` / `get_job` / etc. | Job queue management | ✅ | ✅ `jobs` subcommand |
-| `think` | Deep reasoning (Opus) | ✅ | ❌ planned |
+| `think` | Deep reasoning (DeepSeek) | ✅ | ✅ |
 | `takes_*` | Idea management | ✅ | ❌ planned |
 | `find_contradictions` | Anomaly detection | ✅ | ❌ planned |
 
@@ -117,7 +118,6 @@ SQLite is the **single source of truth**. Tantivy and usearch are derived indice
 | `rbrain get` truncated output | Long pages currently dump full content |
 | Embed progress bar | Shows `[1/N]` but no ETA or percentage |
 | `rbrain sync` → auto re-embed | Sync detects changes but doesn't trigger re-embedding |
-| Dream cycle | Autonomous multi-step wiki synthesis via subagent loop |
 
 ---
 
@@ -230,6 +230,7 @@ rbrain doctor        Health check (--fix)
 rbrain stats         Brain statistics
 rbrain serve mcp     Start MCP server
 rbrain jobs          Job queue management
+rbrain dream         Run autonomous dream cycle (lint -> embed -> extract -> synthesize)
 ```
 
 ---
