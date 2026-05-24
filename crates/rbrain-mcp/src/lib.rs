@@ -18,14 +18,6 @@ impl RBrainMcpServer {
     }
 }
 
-fn detect_lang(text: &str) -> rbrain_core::page::Language {
-    match whatlang::detect(text).map(|i| i.lang()) {
-        Some(whatlang::Lang::Jpn) => rbrain_core::page::Language::Ja,
-        Some(whatlang::Lang::Kor) => rbrain_core::page::Language::Ko,
-        Some(whatlang::Lang::Cmn) => rbrain_core::page::Language::ZhHans,
-        _ => rbrain_core::page::Language::En,
-    }
-}
 
 // ── Argument types ─────────────────────────────────────────────────────────
 
@@ -227,6 +219,7 @@ pub struct LinkRef {
     pub source_slug: String,
     pub edge_type: String,
     pub context: Option<String>,
+    pub chunk_id: Option<i64>,
 }
 
 /// Wrapper for Vec<LinkRef>
@@ -290,7 +283,7 @@ impl RBrainMcpServer {
     async fn query(&self, Parameters(args): Parameters<QueryArgs>) -> Json<ChunkList> {
         let limit = args.limit.map(|l| l.clamp(1, 50) as usize).unwrap_or(10);
         let expand = args.expand.unwrap_or(false);
-        let lang = detect_lang(&args.query);
+        let lang = rbrain_core::page::Language::detect(&args.query);
 
         match self.engine.search_with_context(&args.query, &lang, limit, expand).await {
             Ok(chunks) => Json(ChunkList {
@@ -435,6 +428,7 @@ impl RBrainMcpServer {
                         source_slug: l.target_slug,
                         edge_type: l.edge_type,
                         context: l.context,
+                        chunk_id: l.chunk_id,
                     })
                     .collect(),
             }),
@@ -487,7 +481,7 @@ impl RBrainMcpServer {
     async fn generate(&self, Parameters(args): Parameters<GenerateArgs>) -> Json<GenerateResult> {
         let limit = args.limit.map(|l| l.clamp(1, 20) as usize).unwrap_or(8);
         let expand = args.expand.unwrap_or(false);
-        let lang = detect_lang(&args.topic);
+        let lang = rbrain_core::page::Language::detect(&args.topic);
 
         match self.engine.generate_wiki(&args.topic, &lang, limit, expand).await {
             Ok(wiki) => {
@@ -548,7 +542,7 @@ impl RBrainMcpServer {
             args.context.clone()
         };
 
-        match self.engine.add_link(&args.from, &args.to, link_type, context.as_deref()).await {
+        match self.engine.add_link(&args.from, &args.to, link_type, context.as_deref(), args.chunk_id).await {
             Ok(_) => Json(MutationResult::ok(format!(
                 "Link added: {} --[{}]--> {}{}",
                 args.from, link_type, args.to,
@@ -593,7 +587,7 @@ impl RBrainMcpServer {
             Returns a Markdown reasoning artifact with inline citations. Requires deepseek.api_key."
     )]
     async fn think(&self, Parameters(args): Parameters<ThinkArgs>) -> Json<ThinkResult> {
-        let lang = detect_lang(&args.topic);
+        let lang = rbrain_core::page::Language::detect(&args.topic);
         let limit = args.limit.map(|l| l.clamp(1, 20) as usize).unwrap_or(12);
         let expand = args.expand.unwrap_or(false);
         match self.engine.think(&args.topic, &lang, limit, expand).await {
@@ -674,6 +668,7 @@ impl RBrainMcpServer {
                         source_slug: l.target_slug,
                         edge_type: l.edge_type,
                         context: l.context,
+                        chunk_id: l.chunk_id,
                     })
                     .collect(),
             }),

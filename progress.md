@@ -6,7 +6,7 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 
 ---
 
-## 当前状态（2026-05-21）
+## 当前状态（2026-05-24）
 
 | 功能领域 | 状态 |
 |---------|------|
@@ -22,14 +22,14 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 | MCP server（17 个工具，stdio + HTTP） | ✅ 完成 |
 | Claude Code slash command（/rbrain, /rbrain-edu） | ✅ 完成 |
 | Signal-detector 行为（slash command 内自动捕捉概念） | ✅ 完成 |
-| --mock-embed 全局标志 | ✅ 完成 |
+| --mock-embed global flag | ✅ 完成 |
 | search/query --type/--tag 过滤 | ✅ 完成 |
 | graph-query depth-1 context 显示 | ✅ 完成 |
 | links 多段 evidence 展示（passages） | ✅ 完成 |
 | think 多语言 prompt（CJK/EN） | ✅ 完成 |
 | Embed 进度条（indicatif） | ✅ 完成 |
 | Doctor 增强（embedding 覆盖率/indegree/存储大小） | ✅ 完成 |
-| RBRAIN_HOME 环境变量 + --brain-dir 全局标志 | ✅ 完成 |
+| RBRAIN_HOME 环境变量 + --brain-dir global flag | ✅ 完成 |
 | rbrain put --content 内联写入 | ✅ 完成 |
 | rbrain config show / config get | ✅ 完成 |
 | rbrain health 别名（doctor） | ✅ 完成 |
@@ -37,11 +37,33 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 | rbrain --version | ✅ 完成 |
 | rbrain-research-cli skill（parallel to gbrain skill） | ✅ 完成 |
 | MCP setup guide（Claude Code / Codex CLI / OpenCode） | ✅ 完成 |
-| Salience / Anomalies / Dream cycle | ⬜ 待做 |
+| Dream cycle 自动化知识整理 | ✅ 完成 |
+| Salience / Anomalies | ⬜ 待做 |
 
 ---
 
 ## 提交历史
+
+### Commit 11 — 语言检测优化、多证据片段支持与梦境循环简化版实现
+
+**日期**: 2026-05-24
+
+**新增功能与改进**:
+1. **语言检测机制优化**：
+   - 将散落在各模块的语言检测逻辑统一抽离到最底层的 `rbrain-core` 中的 `Language::detect`。
+   - 引入了高精度的 CJK 启发式算法（韩文/日文假名/繁简分流），修复了简体中文有时会被误判为繁体中文或日语的问题。
+2. **中文停用词过滤**：
+   - 在 `rbrain-search` 的 `keyword_index.rs` 中增加了对高频中文停用词（如“的”、“了”、“在”、“是”、“我”等）的过滤拦截，分词后的关键词匹配更加纯粹，提升了中文检索精度。
+3. **`links` 数据库 Schema 扩展 (多证据片段支持)**：
+   - 编写了数据库迁移 `0008_extend_links_chunk_id.sql`，在 SQLite 数据库中为 `links` 表增加了 `chunk_id` 列，支持在同一源页面的不同段落中多次链接至同一目标页面，且各自保留独立的上下文证据。
+4. **Dream Cycle (梦境循环) 简化版实现**：
+   - 编写了数据库迁移 `0009_dream_metadata.sql`，在 SQLite 数据库中创建 `dream_metadata` 表，记录每个页面的提取时间戳和内容 hash，实现增量知识提取。
+   - 在 `rbrain-engine` 中实现了 Dream Cycle 完整流水线（Linting、Embedding 缺失页、Extracting 实体与事件、Synthesizing 标签文献综述），在 `rbrain-cli` 中新增了 `dream` 子命令并支持 `--stage` 选项。
+   - 适配了 Mock 提取和 Synthesis 合成逻辑，使无 API 密钥的本地测试/集成测试能够 100% 确定性离线运行。
+5. **Markdown Frontmatter 解析修复**：
+   - 修复了 `sync` 和 `import` 命令在解析 Markdown 文件 Frontmatter 后丢失 `tags` 与 `title` 的问题。现在它们能够正确载入 Page 结构并写入数据库，使标签维度的 Dream Synthesis 可以完美识别并执行文献聚合。
+
+---
 
 ### Commit 10 — gbrain-research-cli 功能对齐
 
@@ -251,6 +273,6 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 ## 下一步（按优先级）
 
 1. `rbrain doctor` 增强（embedding 覆盖率、最大 indegree、tantivy index 大小）→ ✅ 已完成
-2. Salience 排序（情感权重 × 时间衰减）
-3. Dream cycle 简化版（4 阶段：lint→embed--stale→extract--all→generate stale synthesis）
-4. links schema 扩展（加 `chunk_id` 列支持真正独立的多条 evidence link）
+2. Dream cycle 简化版（4 阶段：lint -> embed -> extract -> synthesize）→ ✅ 已完成
+3. links schema 扩展（加 `chunk_id` 列支持真正独立的多条 evidence link）→ ✅ 已完成
+4. Salience 排序（情感权重 × 时间衰减）

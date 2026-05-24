@@ -6,6 +6,7 @@ pub struct LinkRef {
     pub target_slug: String,
     pub edge_type: String,
     pub context: Option<String>,
+    pub chunk_id: Option<i64>,
 }
 
 pub fn extract_links(content: &str) -> Vec<LinkRef> {
@@ -26,6 +27,7 @@ pub fn extract_links(content: &str) -> Vec<LinkRef> {
             target_slug: slug,
             edge_type,
             context: Some(sentence),
+            chunk_id: None,
         });
     }
 
@@ -47,6 +49,7 @@ pub fn extract_links(content: &str) -> Vec<LinkRef> {
                 target_slug: slug,
                 edge_type,
                 context: Some(sentence),
+                chunk_id: None,
             });
         }
     }

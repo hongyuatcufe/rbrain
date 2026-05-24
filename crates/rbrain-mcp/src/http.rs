@@ -269,12 +269,7 @@ async fn call_tool(
             let expand = arguments.get("expand")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let lang = match whatlang::detect(&topic).map(|i| i.lang()) {
-                Some(whatlang::Lang::Jpn) => rbrain_core::page::Language::Ja,
-                Some(whatlang::Lang::Kor) => rbrain_core::page::Language::Ko,
-                Some(whatlang::Lang::Cmn) => rbrain_core::page::Language::ZhHans,
-                _ => rbrain_core::page::Language::En,
-            };
+            let lang = rbrain_core::page::Language::detect(&topic);
             engine.think(&topic, &lang, limit, expand).await
                 .map_err(|e| (-32000, format!("Think failed: {}", e)))
         }

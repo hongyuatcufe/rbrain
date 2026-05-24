@@ -264,6 +264,11 @@ enum Commands {
         #[command(subcommand)]
         action: ServeAction,
     },
+    /// Run autonomous dream cycle (lint -> embed -> extract -> synthesize)
+    Dream {
+        #[arg(long, help = "Only run a specific stage of the dream cycle (lint, embed, extract, synthesize)")]
+        stage: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -397,7 +402,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Detect language from content
-            page.language = Some(detect_lang(&page.compiled_truth));
+            page.language = Some(rbrain_core::page::Language::detect(&page.compiled_truth));
 
             engine.put_page(page.clone()).await?;
             println!("Page saved: {}", page.slug);
@@ -698,7 +703,7 @@ async fn main() -> anyhow::Result<()> {
                 context
             };
 
-            engine.add_link(&from, &to, &r#type, resolved_context.as_deref()).await?;
+            engine.add_link(&from, &to, &r#type, resolved_context.as_deref(), from_chunk).await?;
             if from_chunk.is_some() {
                 println!("Link added: {} --[{}]--> {} (context from chunk:{})", from, r#type, to, from_chunk.unwrap());
             } else {
@@ -731,7 +736,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Query { query, expand, limit, r#type, tag } => {
             let config = load_config!();
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
-            let lang = detect_lang(&query);
+            let lang = rbrain_core::page::Language::detect(&query);
 
             let chunks = engine.search_with_context_filtered(
                 &query, &lang, limit * 3, expand,
@@ -747,7 +752,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Search { query, limit, r#type, tag } => {
             let config = load_config!();
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
-            let lang = detect_lang(&query);
+            let lang = rbrain_core::page::Language::detect(&query);
 
             let ids = engine.keyword_search_filtered(
                 &query, &lang, limit * 3,
@@ -779,7 +784,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Generate { topic, limit, save, expand } => {
             let config = load_config!();
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
-            let lang = detect_lang(&topic);
+            let lang = rbrain_core::page::Language::detect(&topic);
 
             eprintln!("Searching for: {}…", topic);
             let wiki = engine.generate_wiki(&topic, &lang, limit, expand).await
@@ -836,7 +841,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Think { topic, limit, save, expand } => {
             let config = load_config!();
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
-            let lang = detect_lang(&topic);
+            let lang = rbrain_core::page::Language::detect(&topic);
 
             eprintln!("Thinking about: {}…", topic);
             let reasoning = engine.think(&topic, &lang, limit, expand).await
@@ -1213,6 +1218,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Dream { stage } => {
+            let config = load_config!();
+            let engine = init_engine_with_search(config.clone(), mock_embed).await?;
+            engine.run_dream_cycle(stage.as_deref()).await?;
+        }
     }
 
     Ok(())
@@ -1290,15 +1300,6 @@ fn fmt_bytes(n: u64) -> String {
     else { format!("{:.2} GB", n as f64 / 1024.0 / 1024.0 / 1024.0) }
 }
 
-fn detect_lang(text: &str) -> rbrain_core::page::Language {
-    match whatlang::detect(text).map(|i| i.lang()) {
-        Some(whatlang::Lang::Jpn) => rbrain_core::page::Language::Ja,
-        Some(whatlang::Lang::Kor) => rbrain_core::page::Language::Ko,
-        Some(whatlang::Lang::Cmn) => rbrain_core::page::Language::ZhHans,
-        Some(whatlang::Lang::Eng) => rbrain_core::page::Language::En,
-        _ => rbrain_core::page::Language::En,
-    }
-}
 
 async fn init_engine_with_search(config: Config, mock_embed: bool) -> anyhow::Result<Engine> {
     let keyword_index = Arc::new(TantivyIndex::new(config.tantivy_dir.clone())?);

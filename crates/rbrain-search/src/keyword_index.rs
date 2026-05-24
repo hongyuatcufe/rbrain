@@ -7,17 +7,34 @@ use rbrain_core::error::{BrainError, Result};
 use rbrain_core::keyword_index::KeywordIndex;
 use rbrain_core::page::Language;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
 
+static CHINESE_STOPWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+
+fn is_chinese_stopword(word: &str) -> bool {
+    let stopwords = CHINESE_STOPWORDS.get_or_init(|| {
+        [
+            "的", "了", "在", "是", "我", "有", "和", "人", "这", "中", "大", "来", "上", "国", "个", 
+            "到", "说", "要", "也", "得", "着", "下", "之", "与", "及", "等", "以", "于", "而", "对", 
+            "为", "自", "因此", "所以", "但是", "然而", "而且", "并且", "我们", "你们", "他们", "它们", 
+            "自己", "或者", "还是", "甚至", "因为", "如果", "虽然", "只是", "不过", "由于", "同时", 
+            "关于", "对于", "按照", "根据", "通过", "一个", "一些", "什么", "这", "那", "都", "这里",
+            "那里", "怎么", "哪个", "哪些", "这样", "那样", "以及"
+        ]
+        .iter()
+        .cloned()
+        .collect()
+    });
+    stopwords.contains(word)
+}
+
 /// Per-language segmenters for CJK pre-tokenisation.
-/// Segments text into morphemes before handing off to tantivy's whitespace tokeniser,
-/// enabling exact morpheme matching without a custom tantivy Tokenizer impl.
 struct CjkSegmenters {
     ja: Option<Segmenter>,
     zh: Option<Segmenter>,
@@ -62,12 +79,20 @@ impl CjkSegmenters {
         };
 
         match segmenter.segment(Cow::Borrowed(text)) {
-            Ok(tokens) => tokens
-                .iter()
-                .map(|t| t.surface.as_ref())
-                .filter(|s| !s.trim().is_empty())
-                .collect::<Vec<_>>()
-                .join(" "),
+            Ok(tokens) => {
+                let mut results = Vec::new();
+                for t in tokens {
+                    let s = t.surface.as_ref().trim();
+                    if s.is_empty() {
+                        continue;
+                    }
+                    if lang_code == "zh" && is_chinese_stopword(s) {
+                        continue;
+                    }
+                    results.push(s.to_string());
+                }
+                results.join(" ")
+            }
             Err(_) => text.to_string(),
         }
     }

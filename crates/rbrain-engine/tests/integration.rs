@@ -197,3 +197,54 @@ async fn test_graph_links() {
         "page-b should have a backlink from page-a"
     );
 }
+
+#[tokio::test]
+async fn test_dream_cycle_flow() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    // Create page 1 with tags and mentions of a concept (e.g. 预训练语言模型)
+    let page1 = Page {
+        tags: vec!["nlp".to_string()],
+        ..Page::new(
+            "paper-1".to_string(),
+            "paper".to_string(),
+            "摘要：预训练语言模型是现代自然语言处理的基础。我们将研究BERT的性能表现。".to_string(),
+        )
+    };
+
+    // Create page 2 with same tag
+    let page2 = Page {
+        tags: vec!["nlp".to_string()],
+        ..Page::new(
+            "paper-2".to_string(),
+            "paper".to_string(),
+            "摘要：基于预训练语言模型，我们实现了多种下游NLP任务的性能突破。".to_string(),
+        )
+    };
+
+    engine.put_page(page1).await.expect("put page1");
+    engine.put_page(page2).await.expect("put page2");
+
+    // Run dream cycle (all stages)
+    engine.run_dream_cycle(None).await.expect("run_dream_cycle");
+
+    // 1. Verify that "concepts/预训练语言模型" was automatically created
+    let concept_page = engine.get_page("concepts/预训练语言模型").await.expect("get concept page");
+    assert_eq!(concept_page.title, "预训练语言模型");
+
+    // 2. Verify that "figures/bert" was automatically created
+    let figure_page = engine.get_page("figures/bert").await.expect("get figure page");
+    assert_eq!(figure_page.title, "BERT");
+
+    // 3. Verify that timeline entry was added to paper-1/paper-2
+    let fetched_p1 = engine.get_page("paper-1").await.expect("get page1");
+    assert!(fetched_p1.timeline.contains("BERT model was officially released"), "Timeline event not found: {}", fetched_p1.timeline);
+
+    // 4. Verify that "synthesis/tag-nlp" was automatically created
+    let synth_page = engine.get_page("synthesis/tag-nlp").await.expect("get synthesis page");
+    assert!(synth_page.title.contains("nlp"), "Synthesis page title incorrect: {}", synth_page.title);
+    assert!(synth_page.compiled_truth.contains("paper-1"), "Synthesis content should refer to paper-1");
+    assert!(synth_page.compiled_truth.contains("paper-2"), "Synthesis content should refer to paper-2");
+}
+

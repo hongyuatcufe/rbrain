@@ -22,6 +22,8 @@ config.toml
 .idea/
 .vscode/
 .sisyphus/
+.antigravitycli/
+scratch/
 *.swp
 *.swo
 

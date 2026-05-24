@@ -4248,6 +4248,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "ferrous-opencc",
  "figment",
  "gray_matter",
  "home",
@@ -4257,6 +4258,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
+ "whatlang",
 ]
 
 [[package]]
@@ -4289,6 +4291,7 @@ dependencies = [
  "rbrain-llm",
  "rbrain-search",
  "regex",
+ "serde",
  "serde_json",
  "sha2",
  "sqlx",
@@ -4324,6 +4327,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "chrono",
  "rbrain-core",
  "rbrain-engine",
  "rmcp",
