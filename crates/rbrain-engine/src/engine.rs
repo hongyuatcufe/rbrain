@@ -131,8 +131,26 @@ impl Engine {
             }
         }
 
+        // Ensure frontmatter reflects current page fields (type, title, tags).
+        // Page::new() starts with an empty frontmatter; programmatic callers set fields
+        // on the struct but not the frontmatter Value, so we merge them here.
+        let fm = {
+            let mut m = match &page.frontmatter {
+                serde_json::Value::Object(map) => map.clone(),
+                _ => serde_json::Map::new(),
+            };
+            m.insert("type".to_string(), serde_json::Value::String(page.page_type.clone()));
+            if !page.title.is_empty() {
+                m.insert("title".to_string(), serde_json::Value::String(page.title.clone()));
+            }
+            let tags_val: Vec<serde_json::Value> = page.tags.iter()
+                .map(|t| serde_json::Value::String(t.clone()))
+                .collect();
+            m.insert("tags".to_string(), serde_json::Value::Array(tags_val));
+            serde_json::Value::Object(m)
+        };
         let canonical = MarkdownParser::to_canonical(
-            &page.frontmatter,
+            &fm,
             &page.compiled_truth,
             &page.timeline,
         );
@@ -2345,9 +2363,9 @@ impl Engine {
                     .unwrap_or(0) > 0;
                     
                 if !exists {
-                    let concept_page = Page::new(concept_slug.clone(), "concept".to_string(), concept.description.clone());
-                    let mut cp = concept_page;
+                    let mut cp = Page::new(concept_slug.clone(), "concept".to_string(), concept.description.clone());
                     cp.title = concept.name.clone();
+                    cp.language = Some(rbrain_core::page::Language::detect(&concept.description));
                     self.put_page(cp).await?;
                     println!("    Created concept page: {}", concept_slug);
                 }
@@ -2372,9 +2390,9 @@ impl Engine {
                     .unwrap_or(0) > 0;
                     
                 if !exists {
-                    let figure_page = Page::new(figure_slug.clone(), "figure".to_string(), figure.description.clone());
-                    let mut fp = figure_page;
+                    let mut fp = Page::new(figure_slug.clone(), "figure".to_string(), figure.description.clone());
                     fp.title = figure.name.clone();
+                    fp.language = Some(rbrain_core::page::Language::detect(&figure.description));
                     self.put_page(fp).await?;
                     println!("    Created figure page: {}", figure_slug);
                 }
@@ -2509,6 +2527,7 @@ impl Engine {
             let mut synth_page = Page::new(synthesis_slug.clone(), "wiki".to_string(), synthesized_content);
             synth_page.title = format!("Synthesis: {}", tag);
             synth_page.tags = vec![tag.clone()];
+            synth_page.language = Some(rbrain_core::page::Language::detect(&synth_page.compiled_truth));
             
             self.put_page(synth_page.clone()).await?;
             println!("    Saved synthesis page: {}", synthesis_slug);

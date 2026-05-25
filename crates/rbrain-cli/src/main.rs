@@ -430,7 +430,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("Title: {}", page.title);
                     println!("Type: {}", page.page_type);
                     println!("Tags: {}", page.tags.join(", "));
-                    println!("Language: {:?}", page.language);
+                    println!("Language: {}", page.language.as_ref().map(|l| l.to_string()).unwrap_or_default());
                     println!("Updated: {}", page.updated_at);
                     println!("\n{}", page.compiled_truth);
                     if !page.timeline.trim().is_empty() {
@@ -794,7 +794,14 @@ async fn main() -> anyhow::Result<()> {
 
             if save {
                 let slug = topic.to_lowercase().replace(' ', "-").replace(['/', '\\', '.'], "-");
-                let page = Page::new(slug.clone(), "wiki".to_string(), wiki);
+                let title = wiki.lines()
+                    .find(|l| l.starts_with("# "))
+                    .map(|l| l.trim_start_matches("# ").to_string())
+                    .unwrap_or_else(|| topic.clone());
+                let detected_lang = rbrain_core::page::Language::detect(&wiki);
+                let mut page = Page::new(slug.clone(), "wiki".to_string(), wiki);
+                page.title = title;
+                page.language = Some(detected_lang);
                 engine.put_page(page.clone()).await?;
                 eprintln!("\nSaved as wiki page: {}", slug);
                 if engine.has_embedder() {
@@ -854,7 +861,10 @@ async fn main() -> anyhow::Result<()> {
                     "synthesis/{}",
                     topic.to_lowercase().replace(' ', "-").replace(['/', '\\', '.'], "-")
                 );
-                let page = Page::new(slug.clone(), "synthesis".to_string(), reasoning);
+                let detected_lang = rbrain_core::page::Language::detect(&reasoning);
+                let mut page = Page::new(slug.clone(), "synthesis".to_string(), reasoning);
+                page.title = topic.clone();
+                page.language = Some(detected_lang);
                 engine.put_page(page.clone()).await?;
                 eprintln!("\nSaved as synthesis page: {}", slug);
                 if engine.has_embedder() {
