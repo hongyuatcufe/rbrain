@@ -87,13 +87,6 @@ impl Language {
                         Language::ZhHans
                     };
                 }
-                Some(whatlang::Lang::Jpn) | Some(whatlang::Lang::Kor) => {
-                    return if Self::is_traditional(text) {
-                        Language::ZhHant
-                    } else {
-                        Language::ZhHans
-                    };
-                }
                 _ => {
                     if is_predominantly_han {
                         return if Self::is_traditional(text) {

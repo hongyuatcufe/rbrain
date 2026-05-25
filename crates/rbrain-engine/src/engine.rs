@@ -2657,7 +2657,7 @@ struct ExtractedKnowledge {
 fn clean_json(s: &str) -> &str {
     let mut s = s.trim();
     if s.starts_with("```") {
-        if let Some(end) = s.rfind("```") {
+        if let Some(end) = s.rfind("```").filter(|&e| e > 0) {
             s = &s[3..end];
             if s.starts_with("json") {
                 s = &s[4..];

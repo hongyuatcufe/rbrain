@@ -331,7 +331,7 @@ async fn call_tool(
             let to = arguments.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let link_type = arguments.get("link_type").and_then(|v| v.as_str()).unwrap_or("related").to_string();
             let context = arguments.get("context").and_then(|v| v.as_str()).map(|s| s.to_string());
-            engine.add_link(&from, &to, &link_type, context.as_deref()).await
+            engine.add_link(&from, &to, &link_type, context.as_deref(), None).await
                 .map(|_| format!("Link created: {} --[{}]--> {}", from, link_type, to))
                 .map_err(|e| (-32000, format!("Failed: {}", e)))
         }
