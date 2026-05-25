@@ -2440,124 +2440,159 @@ impl Engine {
     }
 
     async fn dream_synthesize(&self) -> Result<()> {
-        println!("\n[Dream Cycle] Phase 4: Synthesizing tag-based literature reviews...");
-        
-        let pages = self.list_pages(None, None).await?;
-        let mut unique_tags = HashSet::new();
-        for page in &pages {
-            for tag in &page.tags {
-                unique_tags.insert(tag.clone());
-            }
-        }
-        
-        if unique_tags.is_empty() {
-            println!("  No tags found in knowledge base.");
+        println!("\n[Dream Cycle] Phase 4: Synthesizing concept-based literature reviews...");
+
+        // Collect all concept pages
+        let all_pages = self.list_pages(None, None).await?;
+        let concept_pages: Vec<Page> = all_pages.into_iter()
+            .filter(|p| p.page_type == "concept")
+            .collect();
+
+        if concept_pages.is_empty() {
+            println!("  No concept pages found. Run dream --stage extract first.");
             return Ok(());
         }
-        
+
         let deepseek = self.inner.deepseek.as_ref();
-        
-        for tag in unique_tags {
-            let tag_pages = self.list_pages(None, Some(&tag)).await?;
-            let source_pages: Vec<Page> = tag_pages.into_iter()
-                .filter(|p| !p.slug.starts_with("synthesis/") && p.page_type != "concept" && p.page_type != "figure")
+        let mut synthesized = 0usize;
+
+        for concept in &concept_pages {
+            // Find source notes that link to this concept
+            let backlinks = self.backlinks(&concept.slug).await.unwrap_or_default();
+            let source_slugs: Vec<String> = backlinks.into_iter()
+                .filter(|l| !l.target_slug.starts_with("synthesis/")
+                    && !l.target_slug.starts_with("concepts/")
+                    && !l.target_slug.starts_with("figures/"))
+                .map(|l| l.target_slug)
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
                 .collect();
-                
-            if source_pages.len() < 2 {
+
+            // Require at least 3 distinct source articles to synthesize
+            if source_slugs.len() < 3 {
                 continue;
             }
-            
-            let synthesis_slug = format!("synthesis/tag-{}", slugify(&tag));
+
+            // Fetch the actual source pages
+            let mut source_pages: Vec<Page> = Vec::new();
+            for s in &source_slugs {
+                if let Ok(p) = self.get_page(s).await {
+                    source_pages.push(p);
+                }
+            }
+
+            let synthesis_slug = format!("synthesis/{}", concept.slug.trim_start_matches("concepts/"));
             let existing_synth = self.get_page(&synthesis_slug).await.ok();
-            
+
+            // Staleness check: re-synthesize if any source is newer than the synthesis
             let mut is_stale = true;
             if let Some(ref synth) = existing_synth {
                 let synth_updated = synth.updated_at;
-                let mut max_source_updated = synth_updated;
-                for p in &source_pages {
-                    if p.updated_at > max_source_updated {
-                        max_source_updated = p.updated_at;
-                    }
-                }
+                let max_source_updated = source_pages.iter()
+                    .map(|p| p.updated_at)
+                    .max()
+                    .unwrap_or(synth_updated);
                 if max_source_updated <= synth_updated {
                     is_stale = false;
                 }
             }
-            
+
             if !is_stale {
-                println!("  Synthesis for tag '{}' is up to date.", tag);
+                println!("  Synthesis for '{}' is up to date.", concept.slug);
                 continue;
             }
-            
-            println!("  Synthesizing tag '{}' ({} pages)...", tag, source_pages.len());
-            
+
+            println!("  Synthesizing '{}' ({} source articles)...", concept.slug, source_pages.len());
+
             let synthesized_content = if let Some(client) = deepseek {
-                let system = format!("You are an academic research synthesizer. Generate a literature synthesis page for the tag: {}.\n\
-                                      Integrate the key findings, methodologies, and connections from the provided research pages.\n\
-                                      You MUST reference the source pages using Wikilinks [[slug]] to map them in the knowledge graph.\n\
-                                      Structure the synthesis nicely with Markdown:\n\
-                                      - Main H1 title\n\
-                                      - Headings (##) explaining common themes, debates, or progress\n\
-                                      - Clear connections between sources\n\
-                                      - Output in the language of the source materials (Simplified Chinese for Chinese pages).", tag);
-                
+                let concept_desc = if concept.compiled_truth.is_empty() {
+                    concept.title.clone()
+                } else {
+                    let mut idx = 500;
+                    while idx > 0 && !concept.compiled_truth.is_char_boundary(idx) { idx -= 1; }
+                    concept.compiled_truth[..idx.min(concept.compiled_truth.len())].to_string()
+                };
+
+                let system = "You are an academic research synthesizer. \
+                    Given a concept and a set of source articles that reference it, \
+                    generate a structured literature synthesis page. \
+                    You MUST cite source pages using Wikilinks [[slug]]. \
+                    Structure with Markdown: H1 title, ## sections for themes/debates/evidence, \
+                    a ## Working Judgment section with your synthesis, \
+                    and a ## Open Questions section. \
+                    Output in the language of the source materials (Simplified Chinese for Chinese sources).";
+
                 let mut context_items = Vec::new();
                 for p in &source_pages {
-                    let snippet_owned: String;
-                    let snippet = if p.compiled_truth.len() > 1000 {
-                        // char-safe truncation: avoid splitting mid-CJK character
-                        let mut idx = 1000;
-                        while idx > 0 && !p.compiled_truth.is_char_boundary(idx) {
-                            idx -= 1;
-                        }
-                        snippet_owned = p.compiled_truth[..idx].to_string();
-                        &snippet_owned
-                    } else {
-                        &p.compiled_truth
+                    let snippet = {
+                        let mut idx = 800;
+                        while idx > 0 && !p.compiled_truth.is_char_boundary(idx) { idx -= 1; }
+                        p.compiled_truth[..idx.min(p.compiled_truth.len())].to_string()
                     };
-                    context_items.push(format!("Page: [[{}]] (Title: {})\nContent snippet:\n{}", p.slug, p.title, snippet));
+                    context_items.push(format!("Source: [[{}]] ({})\n{}", p.slug, p.title, snippet));
                 }
-                let user = format!("Tag: {}\n\nRelated Pages:\n\n{}", tag, context_items.join("\n\n---\n\n"));
-                match client.chat(&system, &user).await {
+
+                let user = format!(
+                    "Concept: {} (slug: {})\nDescription: {}\n\nSource Articles:\n\n{}",
+                    concept.title, concept.slug, concept_desc,
+                    context_items.join("\n\n---\n\n")
+                );
+
+                match client.chat(system, &user).await {
                     Ok(resp) => resp,
                     Err(e) => {
-                        eprintln!("    WARN: LLM chat call failed for synthesis: {}. Falling back to mock synthesis.", e);
-                        self.generate_mock_synthesis(&tag, &source_pages)
+                        eprintln!("    WARN: LLM call failed for {}: {}. Using mock.", concept.slug, e);
+                        self.generate_mock_concept_synthesis(concept, &source_pages)
                     }
                 }
             } else {
-                self.generate_mock_synthesis(&tag, &source_pages)
+                self.generate_mock_concept_synthesis(concept, &source_pages)
             };
-            
-            let mut synth_page = Page::new(synthesis_slug.clone(), "wiki".to_string(), synthesized_content);
-            synth_page.title = format!("Synthesis: {}", tag);
-            synth_page.tags = vec![tag.clone()];
+
+            let mut synth_page = Page::new(synthesis_slug.clone(), "synthesis".to_string(), synthesized_content);
+            synth_page.title = format!("综合分析：{}", concept.title);
+            synth_page.tags = concept.tags.clone();
             synth_page.language = Some(rbrain_core::page::Language::detect(&synth_page.compiled_truth));
-            
+
             self.put_page(synth_page.clone()).await?;
-            println!("    Saved synthesis page: {}", synthesis_slug);
-            
-            // Re-embed the synthesis page if possible
+            println!("    Saved: {}", synthesis_slug);
+
             if self.has_embedder() {
                 if let Err(e) = self.chunk_and_embed_page(&synth_page).await {
-                    eprintln!("    WARN: failed to embed synthesis page: {}", e);
+                    eprintln!("    WARN: failed to embed {}: {}", synthesis_slug, e);
                 }
             }
+
+            // Link the synthesis back to the concept and its sources
+            let _ = self.add_link(&synthesis_slug, &concept.slug, "develops", None, None).await;
+            for p in &source_pages {
+                let _ = self.add_link(&synthesis_slug, &p.slug, "evidence", None, None).await;
+            }
+
+            synthesized += 1;
         }
-        
+
+        if synthesized == 0 {
+            println!("  No concepts had 3+ source articles. Nothing synthesized.");
+        } else {
+            println!("  Synthesized {} concept(s).", synthesized);
+        }
+
         Ok(())
     }
     
-    fn generate_mock_synthesis(&self, tag: &str, source_pages: &[Page]) -> String {
-        let mut md = format!("# Tag: {} Research Synthesis\n\n", tag);
-        md.push_str("This is a synthesized literature review created in offline mock mode.\n\n");
-        md.push_str("## Core Literature\n\n");
+    fn generate_mock_concept_synthesis(&self, concept: &Page, source_pages: &[Page]) -> String {
+        let mut md = format!("# 综合分析：{}\n\n", concept.title);
+        md.push_str("## 概念说明\n\n");
+        md.push_str(&format!("{}\n\n", concept.compiled_truth));
+        md.push_str("## 核心文献\n\n");
         for p in source_pages {
             md.push_str(&format!("- [[{}]] — **{}**\n", p.slug, p.title));
         }
-        md.push_str("\n## Key Insights\n\n");
-        md.push_str("- **Common Methodology**: The literature shows significant overlap in the methods used.\n");
-        md.push_str("- **Research Progression**: Future directions point toward integration of these approaches.\n");
+        md.push_str("\n## 工作判断\n\n");
+        md.push_str("（待 LLM 综合分析）\n\n");
+        md.push_str("## 开放问题\n\n");
+        md.push_str("（待补充）\n");
         md
     }
 
