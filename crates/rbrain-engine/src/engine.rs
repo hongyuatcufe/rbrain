@@ -2300,22 +2300,27 @@ impl Engine {
             println!("  Extracting from page: {}", slug);
             
             let knowledge = if let Some(client) = deepseek {
-                let system = "You are a knowledge extractor. Extract key concepts, historical/scientific figures (people), and timeline events from the provided text.\n\
-                              Your response must be a JSON object conforming exactly to this structure:\n\
+                let system = "You are a knowledge extractor. Extract key concepts, scholars/figures (people), and timeline events from the provided academic text.\n\
+                              Rules:\n\
+                              - For figures: describe the person by their REAL-WORLD identity (institution, role, field of expertise). NEVER use vague references like '本文作者', 'the author', 'this article's author', '该文作者'. If you can identify them from the text (e.g. affiliation in the abstract), state it; otherwise write their field only (e.g. '教育学研究者，专注高等教育学自主知识体系').\n\
+                              - For concepts: describe based on how the text defines or uses it; include the source article slug for attribution.\n\
+                              - For events: use ISO date (YYYY-MM-DD or YYYY-MM or YYYY); omit if date is unknown.\n\
+                              - Only extract entities with substantive presence in the text (not passing mentions).\n\
+                              Your response must be a raw JSON object (no markdown fences) conforming exactly to:\n\
                               {\n\
                                 \"concepts\": [\n\
-                                  { \"name\": \"Concept Name\", \"description\": \"Short description of concept based on the text\", \"context\": \"Relevant text snippet\" }\n\
+                                  { \"name\": \"Concept Name\", \"description\": \"Definition or role as used in source: <slug>\", \"context\": \"Relevant text snippet\" }\n\
                                 ],\n\
                                 \"figures\": [\n\
-                                  { \"name\": \"Figure Name\", \"description\": \"Short description of figure\", \"context\": \"Relevant text snippet\" }\n\
+                                  { \"name\": \"Full Name\", \"description\": \"Institution/role/field — do NOT say 本文作者\", \"context\": \"Relevant text snippet\" }\n\
                                 ],\n\
                                 \"events\": [\n\
-                                  { \"date\": \"YYYY-MM-DD\", \"description\": \"Short description of event\", \"context\": \"Relevant text snippet\" }\n\
+                                  { \"date\": \"YYYY-MM-DD\", \"description\": \"Event description\", \"context\": \"Relevant text snippet\" }\n\
                                 ]\n\
-                              }\n\
-                              Do not include any Markdown wrapping like ```json or anything else. Just the raw JSON string.";
-                
-                let user = format!("Title: {}\nType: {}\n\nContent:\n{}", title, page_type, compiled_truth);
+                              }";
+
+                let display_title = if title.trim().is_empty() { slug.as_str() } else { title.as_str() };
+                let user = format!("Source slug: {}\nTitle: {}\nType: {}\n\nContent:\n{}", slug, display_title, page_type, compiled_truth);
                 match client.chat(system, &user).await {
                     Ok(resp) => {
                         let cleaned = clean_json(&resp);
