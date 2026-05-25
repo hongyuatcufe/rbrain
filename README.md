@@ -193,8 +193,8 @@ For each concept with 3+ source note backlinks, generates a structured literatur
 rbrain 通过 Model Context Protocol 将所有操作暴露给 Claude Code 等 MCP 客户端。
 
 ```bash
-rbrain serve mcp          # stdio mode (for Claude Code) / stdio 模式
-rbrain serve http --port 3456  # HTTP mode / HTTP 模式
+rbrain serve mcp                  # stdio mode (for Claude Code) / stdio 模式
+rbrain serve mcp --http <PORT>    # HTTP mode / HTTP 模式（如 --http 3456）
 ```
 
 ### MCP Tools / MCP 工具列表
@@ -203,13 +203,16 @@ rbrain serve http --port 3456  # HTTP mode / HTTP 模式
 |------|-------------|
 | `brain_put` | Write or update a page / 写入或更新页面 |
 | `brain_get` | Read a page / 读取页面 |
-| `brain_search` | BM25 keyword search / 关键词检索 |
+| `brain_delete` | Delete a page / 删除页面 |
+| `brain_list` | List pages with optional type/tag filter / 列出页面 |
 | `brain_query` | Hybrid semantic search / 混合语义检索 |
 | `brain_think` | Deep reasoning synthesis on a topic / 深度推理 |
+| `brain_generate` | Search + LLM wiki synthesis / 文献综述生成 |
 | `brain_link` | Create a typed graph link / 建立知识图谱链接 |
 | `brain_unlink` | Remove a link / 删除链接 |
 | `brain_backlinks` | Get incoming links / 反向链接 |
 | `brain_outlinks` | Get outgoing links / 出向链接 |
+| `brain_graph` | Traverse graph neighborhood / 图谱邻域遍历 |
 | `brain_orphans` | List pages with no incoming links / 孤立页面 |
 | `brain_add_timeline_entry` | Add a dated entry to a page / 添加时间线条目 |
 | `brain_add_tag` | Add a tag / 添加标签 |

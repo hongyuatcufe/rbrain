@@ -103,7 +103,6 @@ For CJK corpora: start with `search` on exact names/terms before `query` — spa
 
 **Via MCP:**
 ```
-brain_search(query="...", limit=10)
 brain_query(query="...", limit=12, expand=true)
 brain_get(slug="...")
 brain_backlinks(slug="...")
