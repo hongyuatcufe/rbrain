@@ -1584,6 +1584,16 @@ impl Engine {
             format!("{}\n{}", page.timeline, entry)
         };
 
+        // Write file first; only update DB after filesystem succeeds.
+        let repo_path = self.inner.config.repo_dir.join(format!("{}.md", normalized));
+        let new_hash = if repo_path.exists() {
+            let canonical = MarkdownParser::to_canonical(&page.frontmatter, &page.compiled_truth, &new_timeline);
+            std::fs::write(&repo_path, &canonical)?;
+            Some(MarkdownParser::content_hash(&canonical))
+        } else {
+            None
+        };
+
         sqlx::query(
             "UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2"
         )
@@ -1593,14 +1603,9 @@ impl Engine {
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        // Mirror to filesystem
-        let repo_path = self.inner.config.repo_dir.join(format!("{}.md", normalized));
-        if repo_path.exists() {
-            let canonical = MarkdownParser::to_canonical(&page.frontmatter, &page.compiled_truth, &new_timeline);
-            std::fs::write(&repo_path, &canonical)?;
-            let new_hash = MarkdownParser::content_hash(&canonical);
+        if let Some(hash) = new_hash {
             sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
-                .bind(&new_hash)
+                .bind(&hash)
                 .bind(&normalized)
                 .execute(&self.inner.db)
                 .await
@@ -2475,8 +2480,15 @@ impl Engine {
                 
                 let mut context_items = Vec::new();
                 for p in &source_pages {
+                    let snippet_owned: String;
                     let snippet = if p.compiled_truth.len() > 1000 {
-                        &p.compiled_truth[..1000]
+                        // char-safe truncation: avoid splitting mid-CJK character
+                        let mut idx = 1000;
+                        while idx > 0 && !p.compiled_truth.is_char_boundary(idx) {
+                            idx -= 1;
+                        }
+                        snippet_owned = p.compiled_truth[..idx].to_string();
+                        &snippet_owned
                     } else {
                         &p.compiled_truth
                     };

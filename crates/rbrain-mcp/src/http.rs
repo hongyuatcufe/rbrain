@@ -231,7 +231,7 @@ async fn call_tool(
 
             let results: Vec<_> = links.into_iter()
                 .map(|l| json!({
-                    "source_slug": l.target_slug,
+                    "page_slug": l.target_slug,
                     "edge_type": l.edge_type,
                     "context": l.context,
                 }))

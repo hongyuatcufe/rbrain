@@ -216,7 +216,7 @@ pub struct GraphList {
 
 #[derive(Serialize, JsonSchema)]
 pub struct LinkRef {
-    pub source_slug: String,
+    pub page_slug: String,
     pub edge_type: String,
     pub context: Option<String>,
     pub chunk_id: Option<i64>,
@@ -425,7 +425,7 @@ impl RBrainMcpServer {
                 results: links
                     .into_iter()
                     .map(|l| LinkRef {
-                        source_slug: l.target_slug,
+                        page_slug: l.target_slug,
                         edge_type: l.edge_type,
                         context: l.context,
                         chunk_id: l.chunk_id,
@@ -665,7 +665,7 @@ impl RBrainMcpServer {
                 results: links
                     .into_iter()
                     .map(|l| LinkRef {
-                        source_slug: l.target_slug,
+                        page_slug: l.target_slug,
                         edge_type: l.edge_type,
                         context: l.context,
                         chunk_id: l.chunk_id,
