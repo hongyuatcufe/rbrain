@@ -2026,7 +2026,7 @@ impl Engine {
         let system = "你是知识库编辑。根据提供的原文材料，生成一篇简洁的Markdown wiki页面。\
             要求：包含一级标题、2-4个核心观点（用##小节）、简短结语。\
             严格基于原文，不添加原文没有的内容。输出简体中文。\
-            引用原文时，用 [[page_slug]] 格式标注来源。每个核心观点至少标注一处来源。";
+            引用原文时，用 [[slug | chunk:N]] 格式标注来源（slug 和 chunk 编号均来自原文材料头部的标注）。每个核心观点至少标注一处来源。";
         let user = format!(
             "主题：【{topic}】\n\n原文材料：\n\n{context}\n\n请生成wiki页面。"
         );
@@ -2325,6 +2325,7 @@ impl Engine {
                               - For figures: describe the person by their REAL-WORLD identity (institution, role, field of expertise). NEVER use vague references like '本文作者', 'the author', 'this article's author', '该文作者'. If you can identify them from the text (e.g. affiliation in the abstract), state it; otherwise write their field only (e.g. '教育学研究者，专注高等教育学自主知识体系').\n\
                               - For concepts: describe based on how the text defines or uses it; include the source article slug for attribution.\n\
                               - For events: use ISO date (YYYY-MM-DD or YYYY-MM or YYYY); omit if date is unknown.\n\
+                              - For events: if the event is about a specific scholar or person you extracted as a figure, set figure_slug to \"research/figures/<slugified-name>\" (lowercase, spaces→hyphens, keep CJK as-is). If not tied to a person, leave figure_slug as empty string.\n\
                               - Only extract entities with substantive presence in the text (not passing mentions).\n\
                               Your response must be a raw JSON object (no markdown fences) conforming exactly to:\n\
                               {\n\
@@ -2335,7 +2336,7 @@ impl Engine {
                                   { \"name\": \"Full Name\", \"description\": \"Institution/role/field — do NOT say 本文作者\", \"context\": \"Relevant text snippet\" }\n\
                                 ],\n\
                                 \"events\": [\n\
-                                  { \"date\": \"YYYY-MM-DD\", \"description\": \"Event description\", \"context\": \"Relevant text snippet\" }\n\
+                                  { \"date\": \"YYYY-MM-DD\", \"description\": \"Event description\", \"context\": \"Relevant text snippet\", \"figure_slug\": \"research/figures/姓名 or empty\" }\n\
                                 ]\n\
                               }";
 
@@ -2431,7 +2432,8 @@ impl Engine {
                 }
             }
             
-            // 3. Save extracted events
+            // 3. Save extracted events — route to figure page when figure_slug is set,
+            //    otherwise fall back to the source article page.
             let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
             for event in &knowledge.events {
                 if event.description.trim().is_empty() {
@@ -2443,10 +2445,27 @@ impl Engine {
                     &event.date
                 };
                 let event_src = Some(slug.as_str());
-                if let Err(e) = self.add_timeline_entry(&slug, date_str, &event.description, event_src).await {
-                    eprintln!("    WARN: failed to add timeline entry to {}: {}", slug, e);
+
+                // Determine target page: figure page if the LLM named one and it exists,
+                // otherwise the source article itself.
+                let target_slug = if !event.figure_slug.trim().is_empty() {
+                    let fig = event.figure_slug.trim();
+                    let fig_exists = sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM pages WHERE slug = ?1"
+                    )
+                    .bind(fig)
+                    .fetch_one(&self.inner.db)
+                    .await
+                    .unwrap_or(0) > 0;
+                    if fig_exists { fig.to_string() } else { slug.clone() }
                 } else {
-                    println!("    Added timeline event: {} on {}", event.description, date_str);
+                    slug.clone()
+                };
+
+                if let Err(e) = self.add_timeline_entry(&target_slug, date_str, &event.description, event_src).await {
+                    eprintln!("    WARN: failed to add timeline entry to {}: {}", target_slug, e);
+                } else {
+                    println!("    Added timeline event to {}: {} on {}", target_slug, event.description, date_str);
                 }
             }
             
@@ -2642,6 +2661,7 @@ impl Engine {
                 date: "2018-10-11".to_string(),
                 description: "BERT model was officially released by Google researchers.".to_string(),
                 context: "本研究针对中文文本分类任务，对比了基于BERT和RoBERTa等不同架构的模型表现。".to_string(),
+                figure_slug: String::new(),
             });
         } else {
             let words: Vec<&str> = page.title.split_whitespace().collect();
@@ -2660,6 +2680,7 @@ impl Engine {
                 date: "2026-05-24".to_string(),
                 description: format!("Mock milestone event for {}", page.title),
                 context: page.title.clone(),
+                figure_slug: String::new(),
             });
         }
 
@@ -2741,6 +2762,10 @@ struct ExtractedEvent {
     date: String,
     description: String,
     context: String,
+    /// Slug of the figure page this event belongs to (e.g. "research/figures/张三").
+    /// Empty string if the event is not attributed to a specific figure.
+    #[serde(default)]
+    figure_slug: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
