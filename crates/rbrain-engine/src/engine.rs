@@ -1680,7 +1680,7 @@ impl Engine {
                 3. 形成有依据的工作判断（注明不确定之处）\
                 4. 列出尚待回答的开放性问题\
                 5. 用Markdown格式，包含：## 核心观点 / ## 张力与矛盾 / ## 工作判断 / ## 开放问题\
-                引用材料时注明来源slug。";
+                引用材料时用 [[slug]] 格式标注来源，每个核心论断至少注明一处。";
             let usr = format!("研究问题：{}\n\n材料：\n\n{}", topic, context);
             (sys, usr)
         } else {
@@ -1691,7 +1691,7 @@ impl Engine {
                 3. Form a working judgment (flagging uncertainty where it exists)\
                 4. List open questions that remain unanswered\
                 Use Markdown with sections: ## Core Claims / ## Tensions & Gaps / ## Working Judgment / ## Open Questions\
-                Cite sources by slug when referencing material.";
+                Cite sources using [[slug]] wikilink format. Each key claim must cite at least one source.";
             let usr = format!("Research question: {}\n\nSources:\n\n{}", topic, context);
             (sys, usr)
         };
@@ -2019,13 +2019,14 @@ impl Engine {
 
         let context = chunks
             .iter()
-            .map(|c| format!("[来源: {}]\n{}", c.page_slug, c.text))
+            .map(|c| format!("[来源: {} | chunk:{}]\n{}", c.page_slug, c.chunk_id, c.text))
             .collect::<Vec<_>>()
             .join("\n\n---\n\n");
 
         let system = "你是知识库编辑。根据提供的原文材料，生成一篇简洁的Markdown wiki页面。\
             要求：包含一级标题、2-4个核心观点（用##小节）、简短结语。\
-            严格基于原文，不添加原文没有的内容。输出简体中文。";
+            严格基于原文，不添加原文没有的内容。输出简体中文。\
+            引用原文时，用 [[page_slug]] 格式标注来源。每个核心观点至少标注一处来源。";
         let user = format!(
             "主题：【{topic}】\n\n原文材料：\n\n{context}\n\n请生成wiki页面。"
         );
@@ -2231,6 +2232,26 @@ impl Engine {
         Ok(())
     }
 
+    /// Find the DB chunk_id of the chunk in `page_slug` whose text contains `context`.
+    /// Returns None if context is empty, chunks don't exist yet, or no match found.
+    async fn find_chunk_id_for_context(&self, page_slug: &str, context: &str) -> Option<i64> {
+        if context.trim().is_empty() {
+            return None;
+        }
+        let needle: String = context.chars().take(60).collect();
+        let rows = sqlx::query("SELECT id, text FROM chunks WHERE page_slug = ?1")
+            .bind(page_slug)
+            .fetch_all(&self.inner.db)
+            .await
+            .ok()?;
+        rows.into_iter()
+            .find(|r| {
+                let text: String = r.get("text");
+                text.contains(&needle)
+            })
+            .map(|r| r.get::<i64, _>("id"))
+    }
+
     async fn dream_lint(&self) -> Result<()> {
         println!("\n[Dream Cycle] Phase 1: Linting knowledge base...");
         let warnings = self.lint().await?;
@@ -2274,8 +2295,7 @@ impl Engine {
             FROM pages p 
             LEFT JOIN dream_metadata d ON p.slug = d.slug 
             WHERE (d.last_extracted_at IS NULL OR p.updated_at > d.last_extracted_at) 
-              AND p.page_type NOT IN ('concept', 'figure') 
-              AND p.slug NOT LIKE 'synthesis/%'
+              AND p.page_type = 'note'
         ";
         
         let rows = sqlx::query(query)
@@ -2360,7 +2380,7 @@ impl Engine {
                 if concept.name.trim().is_empty() {
                     continue;
                 }
-                let concept_slug = format!("concepts/{}", slugify(&concept.name));
+                let concept_slug = format!("research/concepts/{}", slugify(&concept.name));
                 let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pages WHERE slug = ?1")
                     .bind(&concept_slug)
                     .fetch_one(&self.inner.db)
@@ -2375,9 +2395,10 @@ impl Engine {
                     println!("    Created concept page: {}", concept_slug);
                 }
                 
-                // Link source -> concept
+                // Link source -> concept (anchor to chunk if context can be located)
                 let link_ctx = if concept.context.is_empty() { None } else { Some(concept.context.clone()) };
-                if let Err(e) = self.add_link(&slug, &concept_slug, "related", link_ctx.as_deref(), None).await {
+                let chunk_id = self.find_chunk_id_for_context(&slug, &concept.context).await;
+                if let Err(e) = self.add_link(&slug, &concept_slug, "related", link_ctx.as_deref(), chunk_id).await {
                     eprintln!("    WARN: failed to create link from {} to {}: {}", slug, concept_slug, e);
                 }
             }
@@ -2387,7 +2408,7 @@ impl Engine {
                 if figure.name.trim().is_empty() {
                     continue;
                 }
-                let figure_slug = format!("figures/{}", slugify(&figure.name));
+                let figure_slug = format!("research/figures/{}", slugify(&figure.name));
                 let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pages WHERE slug = ?1")
                     .bind(&figure_slug)
                     .fetch_one(&self.inner.db)
@@ -2402,9 +2423,10 @@ impl Engine {
                     println!("    Created figure page: {}", figure_slug);
                 }
                 
-                // Link source -> figure
+                // Link source -> figure (anchor to chunk if context can be located)
                 let link_ctx = if figure.context.is_empty() { None } else { Some(figure.context.clone()) };
-                if let Err(e) = self.add_link(&slug, &figure_slug, "related", link_ctx.as_deref(), None).await {
+                let chunk_id = self.find_chunk_id_for_context(&slug, &figure.context).await;
+                if let Err(e) = self.add_link(&slug, &figure_slug, "related", link_ctx.as_deref(), chunk_id).await {
                     eprintln!("    WARN: failed to create link from {} to {}: {}", slug, figure_slug, e);
                 }
             }
@@ -2420,7 +2442,7 @@ impl Engine {
                 } else {
                     &event.date
                 };
-                let event_src = Some(title.as_str());
+                let event_src = Some(slug.as_str());
                 if let Err(e) = self.add_timeline_entry(&slug, date_str, &event.description, event_src).await {
                     eprintln!("    WARN: failed to add timeline entry to {}: {}", slug, e);
                 } else {
@@ -2457,16 +2479,17 @@ impl Engine {
         let mut synthesized = 0usize;
 
         for concept in &concept_pages {
-            // Find source notes that link to this concept
-            let backlinks = self.backlinks(&concept.slug).await.unwrap_or_default();
-            let source_slugs: Vec<String> = backlinks.into_iter()
-                .filter(|l| !l.target_slug.starts_with("synthesis/")
-                    && !l.target_slug.starts_with("concepts/")
-                    && !l.target_slug.starts_with("figures/"))
-                .map(|l| l.target_slug)
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
+            // Find source notes that link to this concept (page_type = 'note' only)
+            let source_slugs: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT l.source_slug FROM links l
+                 JOIN pages p ON p.slug = l.source_slug
+                 WHERE l.target_slug = ?1
+                 AND p.page_type = 'note'"
+            )
+            .bind(&concept.slug)
+            .fetch_all(&self.inner.db)
+            .await
+            .unwrap_or_default();
 
             // Require at least 3 distinct source articles to synthesize
             if source_slugs.len() < 3 {
@@ -2481,7 +2504,7 @@ impl Engine {
                 }
             }
 
-            let synthesis_slug = format!("synthesis/{}", concept.slug.trim_start_matches("concepts/"));
+            let synthesis_slug = format!("research/synthesis/{}", concept.slug.trim_start_matches("research/concepts/"));
             let existing_synth = self.get_page(&synthesis_slug).await.ok();
 
             // Staleness check: re-synthesize if any source is newer than the synthesis
@@ -2504,14 +2527,15 @@ impl Engine {
 
             println!("  Synthesizing '{}' ({} source articles)...", concept.slug, source_pages.len());
 
+            let concept_desc = if concept.compiled_truth.is_empty() {
+                concept.title.clone()
+            } else {
+                let mut idx = 500;
+                while idx > 0 && !concept.compiled_truth.is_char_boundary(idx) { idx -= 1; }
+                concept.compiled_truth[..idx.min(concept.compiled_truth.len())].to_string()
+            };
+
             let synthesized_content = if let Some(client) = deepseek {
-                let concept_desc = if concept.compiled_truth.is_empty() {
-                    concept.title.clone()
-                } else {
-                    let mut idx = 500;
-                    while idx > 0 && !concept.compiled_truth.is_char_boundary(idx) { idx -= 1; }
-                    concept.compiled_truth[..idx.min(concept.compiled_truth.len())].to_string()
-                };
 
                 let system = "You are an academic research synthesizer. \
                     Given a concept and a set of source articles that reference it, \
@@ -2564,9 +2588,10 @@ impl Engine {
             }
 
             // Link the synthesis back to the concept and its sources
-            let _ = self.add_link(&synthesis_slug, &concept.slug, "develops", None, None).await;
+            let _ = self.add_link(&synthesis_slug, &concept.slug, "develops", Some(&concept_desc), None).await;
             for p in &source_pages {
-                let _ = self.add_link(&synthesis_slug, &p.slug, "evidence", None, None).await;
+                let ctx = format!("{} ({})", p.title, p.slug);
+                let _ = self.add_link(&synthesis_slug, &p.slug, "evidence", Some(&ctx), None).await;
             }
 
             synthesized += 1;
