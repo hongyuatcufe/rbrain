@@ -1000,19 +1000,20 @@ impl Engine {
 
         let fetch_ids: Vec<i64> = filtered.iter().map(|(id, _)| *id).collect();
         let texts = self.fetch_chunks_text(&fetch_ids).await?;
-        let text_map: HashMap<i64, (String, String)> = texts
+        let text_map: HashMap<i64, (String, String, String)> = texts
             .into_iter()
-            .map(|(id, text, slug)| (id, (text, slug)))
+            .map(|(id, text, slug, pt)| (id, (text, slug, pt)))
             .collect();
 
         Ok(filtered
             .into_iter()
             .filter_map(|(id, score)| {
-                text_map.get(&id).map(|(text, slug)| ChunkResult {
+                text_map.get(&id).map(|(text, slug, pt)| ChunkResult {
                     chunk_id: id,
                     score,
                     text: text.clone(),
                     page_slug: slug.clone(),
+                    page_type: pt.clone(),
                 })
             })
             .collect())
@@ -1276,13 +1277,18 @@ impl Engine {
         Ok(boosted_results)
     }
 
-    /// Fetch chunk text and page_slug for a set of chunk IDs, preserving rank order.
-    pub async fn fetch_chunks_text(&self, ids: &[i64]) -> Result<Vec<(i64, String, String)>> {
+    /// Fetch chunk text, page_slug, and page_type for a set of chunk IDs, preserving rank order.
+    pub async fn fetch_chunks_text(&self, ids: &[i64]) -> Result<Vec<(i64, String, String, String)>> {
         if ids.is_empty() {
             return Ok(vec![]);
         }
         let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let query = format!("SELECT id, text, page_slug FROM chunks WHERE id IN ({})", placeholders);
+        let query = format!(
+            "SELECT c.id, c.text, c.page_slug, COALESCE(p.page_type, 'note') as page_type \
+             FROM chunks c LEFT JOIN pages p ON c.page_slug = p.slug \
+             WHERE c.id IN ({})",
+            placeholders
+        );
         let mut sql = sqlx::query(&query);
         for id in ids {
             sql = sql.bind(id);
@@ -1292,14 +1298,17 @@ impl Engine {
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        let mut map: HashMap<i64, (String, String)> = rows
+        let mut map: HashMap<i64, (String, String, String)> = rows
             .iter()
-            .map(|r| (r.get::<i64, _>("id"), (r.get::<String, _>("text"), r.get::<String, _>("page_slug"))))
+            .map(|r| (
+                r.get::<i64, _>("id"),
+                (r.get::<String, _>("text"), r.get::<String, _>("page_slug"), r.get::<String, _>("page_type")),
+            ))
             .collect();
 
         Ok(ids
             .iter()
-            .filter_map(|id| map.remove(id).map(|(text, slug)| (*id, text, slug)))
+            .filter_map(|id| map.remove(id).map(|(text, slug, pt)| (*id, text, slug, pt)))
             .collect())
     }
 
@@ -1330,19 +1339,20 @@ impl Engine {
         let ids: Vec<i64> = ranked.iter().map(|(id, _)| *id).collect();
         let texts = self.fetch_chunks_text(&ids).await?;
 
-        let text_map: HashMap<i64, (String, String)> = texts
+        let text_map: HashMap<i64, (String, String, String)> = texts
             .into_iter()
-            .map(|(id, text, slug)| (id, (text, slug)))
+            .map(|(id, text, slug, pt)| (id, (text, slug, pt)))
             .collect();
 
         Ok(ranked
             .into_iter()
             .filter_map(|(id, score)| {
-                text_map.get(&id).map(|(text, slug)| ChunkResult {
+                text_map.get(&id).map(|(text, slug, pt)| ChunkResult {
                     chunk_id: id,
                     score,
                     text: text.clone(),
                     page_slug: slug.clone(),
+                    page_type: pt.clone(),
                 })
             })
             .collect())
@@ -1634,6 +1644,73 @@ impl Engine {
         Ok(())
     }
 
+    /// Fetch raw/note sources cited by a synthesis or wiki page, with their link context.
+    /// Returns (target_slug, display_title, link_context) tuples.
+    async fn fetch_synthesis_sources(&self, slug: &str) -> Vec<(String, String, String)> {
+        let rows = sqlx::query(
+            "SELECT l.target_slug, COALESCE(NULLIF(p.title,''), l.target_slug) as title, COALESCE(l.context,'') as ctx
+             FROM links l
+             LEFT JOIN pages p ON p.slug = l.target_slug
+             WHERE l.source_slug = ?1
+               AND (l.target_slug LIKE 'raw/%' OR p.page_type = 'note')
+             ORDER BY l.chunk_id, l.target_slug"
+        )
+        .bind(slug)
+        .fetch_all(&self.inner.db)
+        .await
+        .unwrap_or_default();
+
+        rows.into_iter()
+            .map(|r| {
+                let target: String = r.get("target_slug");
+                let title: String = r.get("title");
+                let ctx: String = r.get("ctx");
+                // Derive display title: if stored title equals slug, parse slug for author/article
+                let display = if title == target {
+                    let stem = target.rsplit('/').next().unwrap_or(target.as_str());
+                    if let Some(pos) = stem.rfind('_') {
+                        format!("《{}》[{}]", &stem[..pos], &stem[pos + 1..])
+                    } else {
+                        stem.to_string()
+                    }
+                } else {
+                    title
+                };
+                (target, display, ctx)
+            })
+            .collect()
+    }
+
+    /// Build a context block for a single chunk, annotating synthesis/wiki chunks with their
+    /// original sources so the LLM can attribute ideas to the correct primary authors.
+    async fn build_chunk_block(&self, c: &ChunkResult, is_cjk: bool) -> String {
+        let header = if is_cjk {
+            format!("[来源: {} | chunk:{} | 类型: {}]", c.page_slug, c.chunk_id, c.page_type)
+        } else {
+            format!("[source: {} | chunk:{} | type: {}]", c.page_slug, c.chunk_id, c.page_type)
+        };
+
+        let mut block = format!("{}\n{}", header, c.text);
+
+        if matches!(c.page_type.as_str(), "synthesis" | "wiki") {
+            let sources = self.fetch_synthesis_sources(&c.page_slug).await;
+            if !sources.is_empty() {
+                let label = if is_cjk { "[本段所引原始文献]" } else { "[Original sources for this synthesis]" };
+                block.push_str(&format!("\n\n{}", label));
+                for (slug, display, ctx) in &sources {
+                    block.push_str(&format!("\n- {} → {}", display, slug));
+                    if !ctx.is_empty() {
+                        let preview: String = ctx.chars().take(80).collect();
+                        let lead = if is_cjk { "  论点：" } else { "  claim: " };
+                        block.push_str(&format!("\n{}{}", lead, preview));
+                    }
+                }
+            }
+        }
+
+        block
+    }
+
     /// Deep-reasoning synthesis: search context, then prompt LLM to reason through
     /// contradictions, open questions, and form a working judgment.
     /// Unlike generate_wiki (output-focused), think is reasoning-artifact-focused.
@@ -1663,17 +1740,11 @@ impl Engine {
             | rbrain_core::page::Language::Ko
         );
 
-        let context = chunks
-            .iter()
-            .map(|c| {
-                if is_cjk {
-                    format!("[来源: {} | chunk:{}]\n{}", c.page_slug, c.chunk_id, c.text)
-                } else {
-                    format!("[source: {} | chunk:{}]\n{}", c.page_slug, c.chunk_id, c.text)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n---\n\n");
+        let mut context_parts = Vec::new();
+        for c in &chunks {
+            context_parts.push(self.build_chunk_block(c, is_cjk).await);
+        }
+        let context = context_parts.join("\n\n---\n\n");
 
         let (system, user) = if is_cjk {
             let sys = "你是一位严谨的学术研究者。根据提供的原始材料，对给定问题进行深入推理：\
@@ -1681,8 +1752,14 @@ impl Engine {
                 2. 指出材料间的张力、矛盾或空白\
                 3. 形成有依据的工作判断（注明不确定之处）\
                 4. 列出尚待回答的开放性问题\
-                5. 用Markdown格式，包含：## 核心观点 / ## 张力与矛盾 / ## 工作判断 / ## 开放问题\
-                引用材料时用 [[slug | chunk:N]] 格式标注来源（slug 和 chunk 编号来自材料头部标注），每个核心论断至少注明一处。";
+                5. 用Markdown格式，包含：## 核心观点 / ## 张力与矛盾 / ## 工作判断 / ## 开放问题\n\
+                引用规则：\
+                - 引用材料时用 [[slug | chunk:N]] 格式，slug 和 chunk 编号来自材料头部标注，每个核心论断至少注明一处。\
+                - 若材料标注「类型: synthesis」或「类型: wiki」，这是对原始文献的综合，非一手来源。\
+                  其「本段所引原始文献」块列出了原始作者和论文，请将论点归因于该块中列出的原始作者\
+                  （格式：某作者（年份）认为……[[raw/articles/原文slug | chunk:N]]），\
+                  引用该原始文献的 slug，而非引用综述页面。综述仅作为发现线索，学术归因须落到原始来源。\
+                - 标注「类型: note」的材料或 raw/ 开头的 slug 可直接引用。";
             let usr = format!("研究问题：{}\n\n材料：\n\n{}", topic, context);
             (sys, usr)
         } else {
@@ -1692,8 +1769,16 @@ impl Engine {
                 2. Note tensions, contradictions, or gaps between sources\
                 3. Form a working judgment (flagging uncertainty where it exists)\
                 4. List open questions that remain unanswered\
-                Use Markdown with sections: ## Core Claims / ## Tensions & Gaps / ## Working Judgment / ## Open Questions\
-                Cite sources using [[slug | chunk:N]] wikilink format (slug and chunk number from the source header). Each key claim must cite at least one source.";
+                Use Markdown with sections: ## Core Claims / ## Tensions & Gaps / ## Working Judgment / ## Open Questions\n\
+                Citation rules:\
+                - Cite sources using [[slug | chunk:N]] format (slug and chunk number from the source header). Each key claim must cite at least one source.\
+                - If a source is marked \"type: synthesis\" or \"type: wiki\", it is a secondary source summarising primary literature. \
+                  Its \"[Original sources]\" block lists the original authors and articles. \
+                  Attribute ideas to the authors listed in that block \
+                  (format: Author (year) argues... [[raw/articles/slug | chunk:N]]) \
+                  and cite the original source slugs, not the synthesis page. \
+                  The synthesis is a finding aid, not a citable primary source.\
+                - Sources marked \"type: note\" or raw/ slugs can be cited directly.";
             let usr = format!("Research question: {}\n\nSources:\n\n{}", topic, context);
             (sys, usr)
         };
@@ -2019,16 +2104,23 @@ impl Engine {
             });
         }
 
-        let context = chunks
-            .iter()
-            .map(|c| format!("[来源: {} | chunk:{}]\n{}", c.page_slug, c.chunk_id, c.text))
-            .collect::<Vec<_>>()
-            .join("\n\n---\n\n");
+        let mut context_parts = Vec::new();
+        for c in &chunks {
+            context_parts.push(self.build_chunk_block(c, true).await);
+        }
+        let context = context_parts.join("\n\n---\n\n");
 
         let system = "你是知识库编辑。根据提供的原文材料，生成一篇简洁的Markdown wiki页面。\
             要求：包含一级标题、2-4个核心观点（用##小节）、简短结语。\
             严格基于原文，不添加原文没有的内容。输出简体中文。\
-            引用原文时，用 [[slug | chunk:N]] 格式标注来源（slug 和 chunk 编号均来自原文材料头部的标注）。每个核心观点至少标注一处来源。";
+            引用原文时，用 [[slug | chunk:N]] 格式标注来源（slug 和 chunk 编号均来自原文材料头部的标注）。每个核心观点至少标注一处来源。\
+            注意：\
+            - 若材料标注「类型: synthesis」或「类型: wiki」，表示这是对原始文献的综合，\
+              其「本段所引原始文献」块列出了原始作者和论文。\
+              请将论点归因于该块中列出的原始作者\
+              （格式：某作者（年份）认为……[[raw/articles/原文slug | chunk:N]]），\
+              引用该原始文献的 slug，而非仅引用综述页面。综述页面仅作为发现线索，学术归因应落到原始来源。\
+            - 若材料标注「类型: note」或来自 raw/ 路径，直接引用即可。";
         let user = format!(
             "主题：【{topic}】\n\n原文材料：\n\n{context}\n\n请生成wiki页面。"
         );
@@ -2860,6 +2952,7 @@ pub struct ChunkResult {
     pub score: f64,
     pub text: String,
     pub page_slug: String,
+    pub page_type: String,
 }
 
 #[derive(Debug, Clone)]

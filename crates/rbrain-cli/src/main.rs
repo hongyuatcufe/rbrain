@@ -856,17 +856,18 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 let chunk_ids: Vec<i64> = ids.iter().map(|(id, _)| *id).collect();
                 let texts = engine.fetch_chunks_text(&chunk_ids).await?;
-                let text_map: std::collections::HashMap<i64, (String, String)> =
-                    texts.into_iter().map(|(id, text, slug)| (id, (text, slug))).collect();
+                let text_map: std::collections::HashMap<i64, (String, String, String)> =
+                    texts.into_iter().map(|(id, text, slug, page_type)| (id, (text, slug, page_type))).collect();
 
                 let chunks: Vec<rbrain_engine::ChunkResult> = ids
                     .into_iter()
                     .filter_map(|(chunk_id, score)| {
-                        text_map.get(&chunk_id).map(|(text, slug)| rbrain_engine::ChunkResult {
+                        text_map.get(&chunk_id).map(|(text, slug, page_type)| rbrain_engine::ChunkResult {
                             chunk_id,
                             score: score as f64,
                             text: text.clone(),
                             page_slug: slug.clone(),
+                            page_type: page_type.clone(),
                         })
                     })
                     .collect();
