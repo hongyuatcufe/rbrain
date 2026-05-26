@@ -14,20 +14,22 @@ pub fn extract_links(content: &str) -> Vec<LinkRef> {
 
     let text = strip_code_fences(content);
 
-    let wiki_re = Regex::new(r"\[\[([^\]]+)\]\]").unwrap();
+    // Matches [[slug]] and [[slug | chunk:N]] formats
+    let wiki_re = Regex::new(r"\[\[([^|\]]+?)(?:\s*\|\s*chunk:(\d+))?\s*\]\]").unwrap();
     for cap in wiki_re.captures_iter(&text) {
         let slug = cap[1].trim().to_string();
         // Skip image/attachment links
         if is_media_file(&slug) {
             continue;
         }
+        let chunk_id = cap.get(2).and_then(|m| m.as_str().parse::<i64>().ok());
         let sentence = get_sentence_containing(&text, cap.get(0).unwrap().start());
         let edge_type = infer_edge_type(&sentence);
         refs.push(LinkRef {
             target_slug: slug,
             edge_type,
             context: Some(sentence),
-            chunk_id: None,
+            chunk_id,
         });
     }
 
@@ -131,6 +133,25 @@ mod tests {
         let links = extract_links(content);
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].target_slug, "test-page");
+        assert_eq!(links[0].chunk_id, None);
+    }
+
+    #[test]
+    fn test_extract_wikilinks_with_chunk() {
+        let content = "See [[research/concepts/自主知识体系 | chunk:42]] for details.";
+        let links = extract_links(content);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target_slug, "research/concepts/自主知识体系");
+        assert_eq!(links[0].chunk_id, Some(42));
+    }
+
+    #[test]
+    fn test_extract_wikilinks_chunk_no_space() {
+        let content = "See [[some/slug|chunk:7]] here.";
+        let links = extract_links(content);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target_slug, "some/slug");
+        assert_eq!(links[0].chunk_id, Some(7));
     }
 
     #[test]

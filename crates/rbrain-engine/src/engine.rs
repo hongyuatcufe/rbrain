@@ -198,15 +198,17 @@ impl Engine {
         let full_content = format!("{} {}", page.compiled_truth, page.timeline);
         let links = extract_links(&full_content);
         for link in links {
+            let cid = link.chunk_id.unwrap_or(-1);
             sqlx::query(
                 "INSERT OR IGNORE INTO links \
                  (source_slug, target_slug, edge_type, context, created_at, chunk_id) \
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'), -1)",
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5)",
             )
             .bind(&normalized_slug)
             .bind(&link.target_slug)
             .bind(&link.edge_type)
             .bind(&link.context)
+            .bind(cid)
             .execute(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -2324,6 +2326,7 @@ impl Engine {
                               Rules:\n\
                               - For figures: describe the person by their REAL-WORLD identity (institution, role, field of expertise). NEVER use vague references like '本文作者', 'the author', 'this article's author', '该文作者'. If you can identify them from the text (e.g. affiliation in the abstract), state it; otherwise write their field only (e.g. '教育学研究者，专注高等教育学自主知识体系').\n\
                               - For concepts: describe based on how the text defines or uses it; include the source article slug for attribution.\n\
+                              - For concept names: use the shortest canonical form as it appears in the source (e.g., \"自主知识体系\" not \"中国教育学的自主知识体系\"). Do not add qualifiers unless they are part of the established term.\n\
                               - For events: use ISO date (YYYY-MM-DD or YYYY-MM or YYYY); omit if date is unknown.\n\
                               - For events: if the event is about a specific scholar or person you extracted as a figure, set figure_slug to \"research/figures/<slugified-name>\" (lowercase, spaces→hyphens, keep CJK as-is). If not tied to a person, leave figure_slug as empty string.\n\
                               - Only extract entities with substantive presence in the text (not passing mentions).\n\
@@ -2394,8 +2397,20 @@ impl Engine {
                     cp.language = Some(rbrain_core::page::Language::detect(&concept.description));
                     self.put_page(cp).await?;
                     println!("    Created concept page: {}", concept_slug);
+                } else if !concept.description.trim().is_empty() {
+                    // Enrich existing concept page with new source's perspective
+                    if let Ok(mut existing_page) = self.get_page(&concept_slug).await {
+                        let append = format!(
+                            "\n\n---\n\n*来源：[[{}]]*\n\n{}",
+                            slug,
+                            concept.description.trim()
+                        );
+                        existing_page.compiled_truth.push_str(&append);
+                        self.put_page(existing_page).await.ok();
+                        println!("    Enriched concept page: {}", concept_slug);
+                    }
                 }
-                
+
                 // Link source -> concept (anchor to chunk if context can be located)
                 let link_ctx = if concept.context.is_empty() { None } else { Some(concept.context.clone()) };
                 let chunk_id = self.find_chunk_id_for_context(&slug, &concept.context).await;
@@ -2686,6 +2701,95 @@ impl Engine {
 
         ExtractedKnowledge { concepts, figures, events }
     }
+
+    /// Traverse the citation graph from a page and collect original source pages (raw/ or notes/).
+    /// Returns a deduplicated list of source entries with their traversal path.
+    pub async fn cite(&self, slug: &str, depth: u8) -> Result<Vec<CiteEntry>> {
+        let normalized = MarkdownParser::normalize_slug(slug);
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut sources: Vec<CiteEntry> = Vec::new();
+        let mut queue: std::collections::VecDeque<(String, Vec<String>, u8)> = std::collections::VecDeque::new();
+
+        visited.insert(normalized.clone());
+        queue.push_back((normalized.clone(), vec![normalized.clone()], 0));
+
+        while let Some((current, path, current_depth)) = queue.pop_front() {
+            let links = self.outlinks(&current).await.unwrap_or_default();
+            for link in links {
+                let target = &link.target_slug;
+                if visited.contains(target) {
+                    continue;
+                }
+                visited.insert(target.clone());
+
+                let is_source = target.starts_with("raw/") || {
+                    // also include notes/ pages as primary sources
+                    let pt: Option<String> = sqlx::query_scalar(
+                        "SELECT page_type FROM pages WHERE slug = ?1"
+                    )
+                    .bind(target)
+                    .fetch_optional(&self.inner.db)
+                    .await
+                    .unwrap_or(None);
+                    pt.as_deref() == Some("note")
+                };
+
+                let mut new_path = path.clone();
+                new_path.push(target.clone());
+
+                if is_source {
+                    let stored_title: Option<String> = sqlx::query_scalar(
+                        "SELECT NULLIF(title, '') FROM pages WHERE slug = ?1"
+                    )
+                    .bind(target)
+                    .fetch_optional(&self.inner.db)
+                    .await
+                    .unwrap_or(None)
+                    .flatten();
+                    // If no stored title, derive from slug: last path segment, split on '_' for author
+                    let title = stored_title.unwrap_or_else(|| {
+                        let stem = target.rsplit('/').next().unwrap_or(target.as_str());
+                        if let Some(pos) = stem.rfind('_') {
+                            let article = &stem[..pos];
+                            let author = &stem[pos + 1..];
+                            format!("{} [{}]", article, author)
+                        } else {
+                            stem.to_string()
+                        }
+                    });
+
+                    let page_type = sqlx::query_scalar::<_, String>(
+                        "SELECT page_type FROM pages WHERE slug = ?1"
+                    )
+                    .bind(target)
+                    .fetch_optional(&self.inner.db)
+                    .await
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "note".to_string());
+
+                    sources.push(CiteEntry {
+                        slug: target.clone(),
+                        title,
+                        path: new_path,
+                        page_type,
+                    });
+                } else if current_depth < depth {
+                    queue.push_back((target.clone(), new_path, current_depth + 1));
+                }
+            }
+        }
+
+        Ok(sources)
+    }
+}
+
+/// A source entry collected during citation graph traversal.
+#[derive(Debug)]
+pub struct CiteEntry {
+    pub slug: String,
+    pub title: String,
+    pub path: Vec<String>,
+    pub page_type: String,
 }
 
 /// Rewrite the `tags:` line in a markdown file's YAML frontmatter.

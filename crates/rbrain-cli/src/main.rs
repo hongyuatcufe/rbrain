@@ -146,6 +146,14 @@ enum Commands {
     },
     /// List pages with no incoming links (orphan pages not referenced by any other page)
     Orphans,
+    /// Generate bibliography from a page's citation graph (traverses outlinks to find raw sources)
+    Cite {
+        slug: String,
+        #[arg(long, default_value = "2", help = "Graph traversal depth")]
+        depth: u8,
+        #[arg(long, default_value = "plain", value_parser = ["plain", "bibtex"], help = "Output format")]
+        format: String,
+    },
     /// Hybrid search (vector + keyword + RRF), results grouped by page
     Query {
         query: String,
@@ -762,6 +770,34 @@ async fn main() -> anyhow::Result<()> {
                 println!("{} orphan page(s) (no incoming links):", orphans.len());
                 for slug in &orphans {
                     println!("  {}", slug);
+                }
+            }
+        }
+        Commands::Cite { slug, depth, format } => {
+            let config = load_config!();
+            let engine = Engine::open(config.clone()).await?;
+            let entries = engine.cite(&slug, depth).await?;
+            if entries.is_empty() {
+                println!("No original sources found reachable from '{}'.", slug);
+                println!("Tip: run `rbrain extract --all` to ensure wikilinks are indexed as graph links.");
+            } else if format == "bibtex" {
+                for entry in &entries {
+                    let key = entry.slug.replace('/', "-").replace([' ', '_'], "-");
+                    println!("@misc{{{},", key);
+                    println!("  title = {{{}}},", entry.title);
+                    println!("  note  = {{rbrain: {}}},", entry.slug);
+                    println!("}}");
+                    println!();
+                }
+            } else {
+                println!("参考文献\n");
+                for (i, entry) in entries.iter().enumerate() {
+                    println!("[{}] {} — {}", i + 1, entry.title, entry.slug);
+                    if entry.path.len() > 1 {
+                        let path_str = entry.path.join(" → ");
+                        println!("    引用路径：{}", path_str);
+                    }
+                    println!();
                 }
             }
         }
