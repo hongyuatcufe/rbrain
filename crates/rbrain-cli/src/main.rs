@@ -156,6 +156,14 @@ enum Commands {
         #[arg(long, help = "Append bibliography to the page and save it back to the brain")]
         append: bool,
     },
+    /// Audit citation quality of a page: flags draft/synthesis citations, duplicate or orphan bibliography entries
+    Audit {
+        /// Slug of the page to audit
+        slug: String,
+        /// Auto-fix safe issues: remove duplicate and orphan bibliography entries
+        #[arg(long, help = "Auto-fix duplicate and orphan bibliography entries (does not replace citation slugs)")]
+        fix: bool,
+    },
     /// Hybrid search (vector + keyword + RRF), results grouped by page
     Query {
         query: String,
@@ -825,6 +833,12 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+        Commands::Audit { slug, fix } => {
+            let config = load_config!();
+            let engine = Engine::open(config).await?;
+            let report = engine.audit_citations(&slug, fix).await?;
+            print!("{}", report.format_text());
         }
         Commands::Query { query, expand, limit, r#type, tag } => {
             let config = load_config!();

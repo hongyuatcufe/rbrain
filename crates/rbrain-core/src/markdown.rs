@@ -50,7 +50,13 @@ impl MarkdownParser {
     pub fn to_canonical(frontmatter: &Value, compiled_truth: &str, timeline: &str) -> String {
         let sorted_fm = Self::sort_frontmatter_key(frontmatter);
         let fm_str = serde_json::to_string(&sorted_fm).unwrap_or_default();
-        format!("---\n{}\n---\n{}\n\n{}\n", fm_str, compiled_truth.trim(), timeline.trim())
+        if timeline.trim().is_empty() {
+            format!("---\n{}\n---\n{}\n", fm_str, compiled_truth.trim())
+        } else {
+            // The `\n---\n` separator is required so split_body can find and extract the
+            // timeline section when the file is re-read by sync or put.
+            format!("---\n{}\n---\n{}\n\n---\n{}\n", fm_str, compiled_truth.trim(), timeline.trim())
+        }
     }
 
     pub fn content_hash(canonical: &str) -> String {
@@ -93,6 +99,27 @@ mod tests {
         let result = MarkdownParser::parse(content);
         assert_eq!(result.compiled_truth, "truth content");
         assert_eq!(result.timeline, "timeline content");
+    }
+
+    #[test]
+    fn test_to_canonical_round_trip_with_timeline() {
+        let fm = serde_json::json!({"type": "note", "title": "T"});
+        let ct = "body content";
+        let tl = "- 2024-01: event [Source: raw/foo]";
+        let canonical = MarkdownParser::to_canonical(&fm, ct, tl);
+        // canonical must contain \n---\n so split_body can recover timeline
+        let parsed = MarkdownParser::parse(&canonical);
+        assert_eq!(parsed.compiled_truth, ct);
+        assert_eq!(parsed.timeline, tl);
+    }
+
+    #[test]
+    fn test_to_canonical_no_timeline() {
+        let fm = serde_json::json!({"type": "note"});
+        let canonical = MarkdownParser::to_canonical(&fm, "body", "");
+        let parsed = MarkdownParser::parse(&canonical);
+        assert_eq!(parsed.compiled_truth, "body");
+        assert_eq!(parsed.timeline, "");
     }
 
     #[test]

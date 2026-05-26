@@ -197,18 +197,29 @@ impl Engine {
 
         let full_content = format!("{} {}", page.compiled_truth, page.timeline);
         let links = extract_links(&full_content);
+
+        // Determine source_chunk_idx for each link by simulating chunking of compiled_truth.
+        let link_lang = page.language.clone().unwrap_or(rbrain_core::page::Language::En);
+        let link_chunker = rbrain_search::chunker::Chunker::new(&link_lang);
+        let ct_chunks = link_chunker.chunk(&page.compiled_truth, &normalized_slug, &link_lang);
+
         for link in links {
             let cid = link.chunk_id.unwrap_or(-1);
+            let src_idx = ct_chunks.iter()
+                .find(|c| c.text.contains(link.target_slug.as_str()))
+                .map(|c| c.chunk_idx as i64)
+                .unwrap_or(-1);
             sqlx::query(
                 "INSERT OR IGNORE INTO links \
-                 (source_slug, target_slug, edge_type, context, created_at, chunk_id) \
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5)",
+                 (source_slug, target_slug, edge_type, context, created_at, chunk_id, source_chunk_idx) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, ?6)",
             )
             .bind(&normalized_slug)
             .bind(&link.target_slug)
             .bind(&link.edge_type)
             .bind(&link.context)
             .bind(cid)
+            .bind(src_idx)
             .execute(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -297,11 +308,10 @@ impl Engine {
         let compiled_truth_chunks =
             chunker.chunk(&page.compiled_truth, &page.slug, &lang);
 
-        let timeline_chunks = if page.timeline.trim().is_empty() {
-            Vec::new()
-        } else {
-            chunker.chunk(&page.timeline, &page.slug, &lang)
-        };
+        // Timeline content is stored in pages.timeline and displayed via rbrain get.
+        // Do NOT embed or index timeline chunks — they are LLM-generated summaries,
+        // not original text, and pollute semantic search causing think to cite them
+        // instead of the original compiled_truth chunks.
 
         let mut idx = 0;
         let mut chunk_ids: Vec<i64> = Vec::new();
@@ -309,31 +319,10 @@ impl Engine {
 
         for chunk in compiled_truth_chunks {
             let language_str = chunk.language.to_string();
-            let is_compiled_truth = if chunk.is_compiled_truth { 1 } else { 0 };
-
-            let chunk_id: i64 = sqlx::query_scalar(
-                "INSERT INTO chunks \
-                 (page_slug, chunk_idx, text, is_compiled_truth, language, has_embedding, indexed_in_vectors, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, datetime('now')) \
-                 RETURNING id",
-            )
-            .bind(&chunk.page_slug)
-            .bind(idx as i64)
-            .bind(&chunk.text)
-            .bind(is_compiled_truth)
-            .bind(&language_str)
-            .fetch_one(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-            chunk_ids.push(chunk_id);
-            chunk_texts.push(chunk.text);
-            idx += 1;
-        }
-
-        for chunk in timeline_chunks {
-            let language_str = chunk.language.to_string();
-            let is_compiled_truth = if chunk.is_compiled_truth { 1 } else { 0 };
+            // Always 1: we passed only compiled_truth to the chunker, so any --- inside
+            // (markdown HR in LLM output, or concept-page definition separators) must not
+            // flip the flag — the entire compiled_truth section is citable content.
+            let is_compiled_truth: i32 = 1;
 
             let chunk_id: i64 = sqlx::query_scalar(
                 "INSERT INTO chunks \
@@ -1426,9 +1415,9 @@ impl Engine {
         let target = MarkdownParser::normalize_slug(target_slug);
         let cid = chunk_id.unwrap_or(-1);
 
-        // Check if a link already exists
+        // Check if a link already exists (explicit links from add_link always have source_chunk_idx = -1)
         let existing_context: Option<String> = sqlx::query_scalar(
-            "SELECT context FROM links WHERE source_slug = ?1 AND target_slug = ?2 AND edge_type = ?3 AND chunk_id = ?4"
+            "SELECT context FROM links WHERE source_slug = ?1 AND target_slug = ?2 AND edge_type = ?3 AND chunk_id = ?4 AND source_chunk_idx = -1"
         )
         .bind(&source)
         .bind(&target)
@@ -1446,9 +1435,9 @@ impl Engine {
         };
 
         sqlx::query(
-            "INSERT INTO links (source_slug, target_slug, edge_type, context, created_at, chunk_id) \
-             VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5) \
-             ON CONFLICT(source_slug, target_slug, edge_type, chunk_id) DO UPDATE SET context = ?4",
+            "INSERT INTO links (source_slug, target_slug, edge_type, context, created_at, chunk_id, source_chunk_idx) \
+             VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, -1) \
+             ON CONFLICT(source_slug, target_slug, edge_type, chunk_id, source_chunk_idx) DO UPDATE SET context = ?4",
         )
         .bind(&source)
         .bind(&target)
@@ -1644,18 +1633,31 @@ impl Engine {
         Ok(())
     }
 
-    /// Fetch raw/note sources cited by a synthesis or wiki page, with their link context.
+    /// Fetch raw/note sources cited by a specific chunk of a synthesis or wiki page.
+    /// Filters by source_chunk_id (DB id of the synthesis chunk) via JOIN on chunks table.
     /// Returns (target_slug, display_title, link_context) tuples.
-    async fn fetch_synthesis_sources(&self, slug: &str) -> Vec<(String, String, String)> {
+    /// When source_chunk_id == -1 (old data), returns empty (silent degradation).
+    async fn fetch_synthesis_sources(
+        &self,
+        slug: &str,
+        source_chunk_id: i64,
+    ) -> Vec<(String, String, String)> {
+        if source_chunk_id < 0 {
+            return Vec::new();
+        }
         let rows = sqlx::query(
             "SELECT l.target_slug, COALESCE(NULLIF(p.title,''), l.target_slug) as title, COALESCE(l.context,'') as ctx
              FROM links l
              LEFT JOIN pages p ON p.slug = l.target_slug
+             JOIN chunks c ON c.page_slug = l.source_slug
+                           AND c.chunk_idx = l.source_chunk_idx
+                           AND c.id = ?2
              WHERE l.source_slug = ?1
                AND (l.target_slug LIKE 'raw/%' OR p.page_type = 'note')
-             ORDER BY l.chunk_id, l.target_slug"
+             ORDER BY l.target_slug"
         )
         .bind(slug)
+        .bind(source_chunk_id)
         .fetch_all(&self.inner.db)
         .await
         .unwrap_or_default();
@@ -1693,7 +1695,7 @@ impl Engine {
         let mut block = format!("{}\n{}", header, c.text);
 
         if matches!(c.page_type.as_str(), "synthesis" | "wiki") {
-            let sources = self.fetch_synthesis_sources(&c.page_slug).await;
+            let sources = self.fetch_synthesis_sources(&c.page_slug, c.chunk_id).await;
             if !sources.is_empty() {
                 let label = if is_cjk { "[本段所引原始文献]" } else { "[Original sources for this synthesis]" };
                 block.push_str(&format!("\n\n{}", label));
@@ -1728,7 +1730,10 @@ impl Engine {
             }
         })?;
 
-        let chunks = self.search_with_context(topic, lang, limit, expand).await?;
+        let chunks: Vec<ChunkResult> = self.search_with_context(topic, lang, limit, expand).await?
+            .into_iter()
+            .filter(|c| !matches!(c.page_type.as_str(), "draft" | "synthesis" | "wiki"))
+            .collect();
         if chunks.is_empty() {
             return Ok(format!("No relevant content found in brain for: {}", topic));
         }
@@ -2095,7 +2100,10 @@ impl Engine {
             }
         })?;
 
-        let chunks = self.search_with_context(topic, lang, limit, expand).await?;
+        let chunks: Vec<ChunkResult> = self.search_with_context(topic, lang, limit, expand).await?
+            .into_iter()
+            .filter(|c| !matches!(c.page_type.as_str(), "draft" | "synthesis" | "wiki"))
+            .collect();
 
         if chunks.is_empty() {
             return Err(BrainError::ApiUnreachable {
@@ -2664,9 +2672,10 @@ impl Engine {
             let synthesized_content = if let Some(client) = deepseek {
 
                 let system = "You are an academic research synthesizer. \
-                    Given a concept and a set of source articles that reference it, \
+                    Given a concept and source article chunks (each labelled with its chunk ID), \
                     generate a structured literature synthesis page. \
-                    You MUST cite source pages using Wikilinks [[slug]]. \
+                    You MUST cite sources using Wikilinks [[slug | chunk:N]] where N is the exact chunk ID shown in the context. \
+                    Never cite just [[slug]] without a chunk ID — the chunk ID is required for traceability. \
                     Structure with Markdown: H1 title, ## sections for themes/debates/evidence, \
                     a ## Working Judgment section with your synthesis, \
                     and a ## Open Questions section. \
@@ -2674,12 +2683,36 @@ impl Engine {
 
                 let mut context_items = Vec::new();
                 for p in &source_pages {
-                    let snippet = {
+                    let db_chunks: Vec<(i64, String)> = sqlx::query(
+                        "SELECT id, text FROM chunks WHERE page_slug = ?1 AND is_compiled_truth = 1 ORDER BY chunk_idx"
+                    )
+                    .bind(&p.slug)
+                    .fetch_all(&self.inner.db)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| {
+                        use sqlx::Row;
+                        (r.get::<i64, _>("id"), r.get::<String, _>("text"))
+                    })
+                    .collect();
+
+                    if db_chunks.is_empty() {
+                        // Fallback: page not yet chunked, use text snippet
                         let mut idx = 800;
                         while idx > 0 && !p.compiled_truth.is_char_boundary(idx) { idx -= 1; }
-                        p.compiled_truth[..idx.min(p.compiled_truth.len())].to_string()
-                    };
-                    context_items.push(format!("Source: [[{}]] ({})\n{}", p.slug, p.title, snippet));
+                        let snippet = p.compiled_truth[..idx.min(p.compiled_truth.len())].to_string();
+                        context_items.push(format!("Source: [[{}]] ({})\n{}", p.slug, p.title, snippet));
+                    } else {
+                        let chunk_blocks: Vec<String> = db_chunks.iter()
+                            .map(|(id, text)| format!("[chunk:{}] {}", id, text))
+                            .collect();
+                        context_items.push(format!(
+                            "Source: {} ({})\n{}",
+                            p.slug, p.title,
+                            chunk_blocks.join("\n")
+                        ));
+                    }
                 }
 
                 let user = format!(
@@ -2825,6 +2858,243 @@ impl Engine {
         Ok(count)
     }
 
+    /// Audit citation quality of a page: checks for non-primary-source citations,
+    /// duplicate bibliography entries, orphan bibliography entries, and uncited wikilinks.
+    /// With fix=true, automatically removes duplicate and orphan bibliography entries.
+    pub async fn audit_citations(&self, slug: &str, fix: bool) -> Result<AuditReport> {
+        let normalized = MarkdownParser::normalize_slug(slug);
+        let page = self.get_page(&normalized).await?;
+
+        let mut findings: Vec<AuditFinding> = Vec::new();
+        let mut fixed: Vec<String> = Vec::new();
+
+        // ── Check 1: Citation type — flag draft/synthesis/wiki citations ──────────
+        let cited_links = extract_links(&page.compiled_truth);
+        let mut cited_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for link in &cited_links {
+            let slug_norm = MarkdownParser::normalize_slug(&link.target_slug);
+            cited_slugs.insert(slug_norm.clone());
+
+            let pt: Option<String> = sqlx::query_scalar(
+                "SELECT page_type FROM pages WHERE slug = ?1"
+            )
+            .bind(&slug_norm)
+            .fetch_optional(&self.inner.db)
+            .await
+            .unwrap_or(None);
+
+            if let Some(page_type) = pt {
+                if matches!(page_type.as_str(), "draft" | "synthesis" | "wiki") {
+                    let (severity, msg) = if page_type == "draft" {
+                        ("ERROR", format!("自引草稿: [[{}]] 是会话草稿，应替换为原始 raw 文章", slug_norm))
+                    } else {
+                        ("ERROR", format!("非原始文献: [[{}]] 是系统生成的 {} 页，应追溯至 raw 原始文章", slug_norm, page_type))
+                    };
+
+                    // Suggest replacements: first try direct outlinks to raw/note,
+                    // then try two-hop via concept pages (synthesis often links to concepts, not raw)
+                    let outlink_slugs: Vec<String> = sqlx::query_scalar(
+                        "SELECT DISTINCT l.target_slug FROM links l \
+                         JOIN pages p ON p.slug = l.target_slug \
+                         WHERE l.source_slug = ?1 AND p.page_type IN ('raw', 'note') \
+                         ORDER BY l.created_at DESC \
+                         LIMIT 5"
+                    )
+                    .bind(&slug_norm)
+                    .fetch_all(&self.inner.db)
+                    .await
+                    .unwrap_or_default();
+
+                    let outlink_slugs = if outlink_slugs.is_empty() {
+                        // Two-hop: synthesis → concept → raw/note
+                        sqlx::query_scalar(
+                            "SELECT DISTINCT l2.source_slug FROM links l1 \
+                             JOIN pages p1 ON p1.slug = l1.target_slug \
+                             JOIN links l2 ON l2.target_slug = l1.target_slug \
+                             JOIN pages p2 ON p2.slug = l2.source_slug \
+                             WHERE l1.source_slug = ?1 AND p1.page_type = 'concept' \
+                               AND p2.page_type IN ('raw', 'note') \
+                             ORDER BY l2.created_at DESC \
+                             LIMIT 5"
+                        )
+                        .bind(&slug_norm)
+                        .fetch_all(&self.inner.db)
+                        .await
+                        .unwrap_or_default()
+                    } else {
+                        outlink_slugs
+                    };
+
+                    let suggestion = if outlink_slugs.is_empty() {
+                        Some(format!("运行: rbrain backlinks {} 查找原始来源", slug_norm))
+                    } else {
+                        Some(format!("候选替换来源: {}", outlink_slugs.join(", ")))
+                    };
+
+                    findings.push(AuditFinding {
+                        severity,
+                        category: "citation_type",
+                        message: msg,
+                        suggestion,
+                        auto_fixable: false,
+                    });
+                }
+            }
+        }
+
+        // ── Parse bibliography section ─────────────────────────────────────────────
+        // Format: "[N] Title [Author] — raw/slug"
+        let bib_section = page.compiled_truth
+            .find("\n\n## 参考文献")
+            .map(|pos| &page.compiled_truth[pos..]);
+
+        let mut bib_entries: Vec<(usize, String, String)> = Vec::new(); // (num, title, slug)
+        if let Some(bib) = bib_section {
+            for line in bib.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix('[') {
+                    if let Some(bracket_end) = rest.find(']') {
+                        if let Ok(num) = rest[..bracket_end].parse::<usize>() {
+                            let after = rest[bracket_end + 1..].trim().trim_start_matches(' ');
+                            const BIB_SEP: &str = " — ";
+                            if let Some(dash_pos) = after.rfind(BIB_SEP) {
+                                let title = after[..dash_pos].trim().to_string();
+                                let bib_slug = after[dash_pos + BIB_SEP.len()..].trim().to_string();
+                                bib_entries.push((num, title, bib_slug));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Normalize a slug for comparison: NFC + ASCII-ify curly quotes (which differ between
+        // wikilinks and bibliography entries due to editor/LLM differences).
+        let slug_key = |s: &str| -> String {
+            MarkdownParser::normalize_slug(s)
+                .replace('\u{201C}', "\"").replace('\u{201D}', "\"")
+                .replace('\u{2018}', "'").replace('\u{2019}', "'")
+        };
+
+        // ── Check 2: Duplicate bibliography entries ────────────────────────────────
+        let mut seen_bib_slugs: std::collections::HashMap<String, (usize, String)> = std::collections::HashMap::new();
+        for (num, _title, bib_slug) in &bib_entries {
+            let norm_key = slug_key(bib_slug);
+            if let Some((first_num, first_slug)) = seen_bib_slugs.get(&norm_key) {
+                findings.push(AuditFinding {
+                    severity: "WARN",
+                    category: "bib_duplicate",
+                    message: format!("重复参考文献: [{}] 与 [{}] 指向同一文章 {}", num, first_num, first_slug),
+                    suggestion: Some(format!("删除 [{}]，保留 [{}]", num, first_num)),
+                    auto_fixable: true,
+                });
+            } else {
+                seen_bib_slugs.insert(norm_key, (*num, bib_slug.clone()));
+            }
+        }
+
+        // ── Check 3: Orphan bibliography entries ──────────────────────────────────
+        // Use substring search in compiled_truth to avoid Unicode normalization
+        // mismatches (e.g., curly vs straight quotes in slugs with special chars)
+        let ct_nfc = MarkdownParser::normalize_slug(&page.compiled_truth);
+        // ct with ASCII-normalized quotes for matching curly-quote bib slugs
+        let ct_ascii_quotes = ct_nfc
+            .replace('\u{201C}', "\"").replace('\u{201D}', "\"")
+            .replace('\u{2018}', "'").replace('\u{2019}', "'");
+        for (_num, _title, bib_slug) in &bib_entries {
+            let norm_bib = slug_key(bib_slug);
+            // Check: does compiled_truth contain [[bib_slug (as a wikilink prefix)?
+            let wikilink_prefix = format!("[[{}", bib_slug);
+            let wikilink_prefix_norm = format!("[[{}", norm_bib);
+            let cited = page.compiled_truth.contains(wikilink_prefix.as_str())
+                || ct_nfc.contains(wikilink_prefix.as_str())
+                || ct_ascii_quotes.contains(wikilink_prefix_norm.as_str())
+                || cited_slugs.iter().any(|s| slug_key(s) == norm_bib);
+            if !cited {
+                findings.push(AuditFinding {
+                    severity: "WARN",
+                    category: "bib_orphan",
+                    message: format!("游离参考文献: {} 出现在参考文献列表但正文无引用", bib_slug),
+                    suggestion: Some("可删除此条目或在正文中补充引用".to_string()),
+                    auto_fixable: true,
+                });
+                // fix pass recomputes orphan_slugs independently; no tracking needed here
+            }
+        }
+
+        // ── Check 4: In-text citations not in bibliography ─────────────────────────
+        let bib_slug_set: std::collections::HashSet<String> = bib_entries.iter()
+            .map(|(_, _, s)| MarkdownParser::normalize_slug(s))
+            .collect();
+        for slug_ref in &cited_slugs {
+            if slug_ref.starts_with("raw/") || {
+                let pt: Option<String> = sqlx::query_scalar("SELECT page_type FROM pages WHERE slug = ?1")
+                    .bind(slug_ref).fetch_optional(&self.inner.db).await.unwrap_or(None);
+                pt.as_deref() == Some("note")
+            } {
+                let in_bib = bib_slug_set.contains(slug_ref)
+                    || bib_slug_set.iter().any(|b| b.ends_with(slug_ref.as_str()) || slug_ref.ends_with(b.as_str()));
+                if !in_bib && !bib_entries.is_empty() {
+                    findings.push(AuditFinding {
+                        severity: "INFO",
+                        category: "bib_missing",
+                        message: format!("未收录引用: [[{}]] 出现在正文但参考文献列表无此条目", slug_ref),
+                        suggestion: Some("运行 `rbrain cite --append` 更新参考文献".to_string()),
+                        auto_fixable: false,
+                    });
+                }
+            }
+        }
+
+        // ── --fix: Remove duplicate and orphan bibliography entries ───────────────
+        if fix && !bib_entries.is_empty() {
+            let orphan_slugs: std::collections::HashSet<String> = bib_entries.iter()
+                .filter(|(_, _, bib_slug)| {
+                    let norm = slug_key(bib_slug);
+                    let wl = format!("[[{}", bib_slug);
+                    let wl_norm = format!("[[{}", norm);
+                    !page.compiled_truth.contains(wl.as_str())
+                        && !ct_nfc.contains(wl.as_str())
+                        && !ct_ascii_quotes.contains(wl_norm.as_str())
+                        && !cited_slugs.iter().any(|s| slug_key(s) == norm)
+                })
+                .map(|(_, _, s)| s.clone())
+                .collect();
+
+            let mut kept: Vec<(usize, String, String)> = Vec::new();
+            let mut seen_for_fix: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (num, title, bib_slug) in &bib_entries {
+                let norm = slug_key(bib_slug);
+                // Mark as removable if it's a duplicate (seen_for_fix already has this norm) or an orphan
+                if seen_for_fix.contains(&norm) || orphan_slugs.contains(bib_slug.as_str())
+                    || orphan_slugs.iter().any(|o| slug_key(o) == norm)
+                {
+                    fixed.push(format!("删除: [{}] {} — {}", num, title, bib_slug));
+                } else {
+                    seen_for_fix.insert(norm);
+                    kept.push((*num, title.clone(), bib_slug.clone()));
+                }
+            }
+
+            if kept.len() < bib_entries.len() {
+                // Rebuild bibliography section with renumbered entries
+                let mut new_bib = String::from("\n\n## 参考文献\n\n");
+                for (new_num, (_old_num, title, bib_slug)) in kept.iter().enumerate() {
+                    new_bib.push_str(&format!("[{}] {} — {}\n", new_num + 1, title, bib_slug));
+                }
+
+                let mut page_mut = self.get_page(&normalized).await?;
+                if let Some(pos) = page_mut.compiled_truth.find("\n\n## 参考文献") {
+                    page_mut.compiled_truth.truncate(pos);
+                }
+                page_mut.compiled_truth.push_str(&new_bib);
+                self.put_page(page_mut).await?;
+            }
+        }
+
+        Ok(AuditReport { slug: normalized, findings, fixed })
+    }
+
     /// Traverse the citation graph from a page and collect original source pages (raw/ or notes/).
     /// Returns a deduplicated list of source entries with their traversal path.
     pub async fn cite(&self, slug: &str, depth: u8) -> Result<Vec<CiteEntry>> {
@@ -2913,6 +3183,52 @@ pub struct CiteEntry {
     pub title: String,
     pub path: Vec<String>,
     pub page_type: String,
+}
+
+/// A single finding from `audit_citations`.
+#[derive(Debug)]
+pub struct AuditFinding {
+    pub severity: &'static str,
+    pub category: &'static str,
+    pub message: String,
+    pub suggestion: Option<String>,
+    pub auto_fixable: bool,
+}
+
+/// Result returned by `audit_citations`.
+#[derive(Debug)]
+pub struct AuditReport {
+    pub slug: String,
+    pub findings: Vec<AuditFinding>,
+    pub fixed: Vec<String>,
+}
+
+impl AuditReport {
+    pub fn format_text(&self) -> String {
+        let mut out = format!("Audit: {}\n", self.slug);
+        if self.findings.is_empty() && self.fixed.is_empty() {
+            out.push_str("✓ No issues found.\n");
+            return out;
+        }
+        if !self.fixed.is_empty() {
+            out.push_str("\n已自动修复:\n");
+            for f in &self.fixed {
+                out.push_str(&format!("  - {}\n", f));
+            }
+        }
+        let errors: Vec<_> = self.findings.iter().filter(|f| f.severity == "ERROR").collect();
+        let warns: Vec<_> = self.findings.iter().filter(|f| f.severity == "WARN").collect();
+        let infos: Vec<_> = self.findings.iter().filter(|f| f.severity == "INFO").collect();
+        for group in [errors, warns, infos] {
+            for f in group {
+                out.push_str(&format!("\n[{}] {}\n", f.severity, f.message));
+                if let Some(s) = &f.suggestion {
+                    out.push_str(&format!("  建议: {}\n", s));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Rewrite the `tags:` line in a markdown file's YAML frontmatter.
