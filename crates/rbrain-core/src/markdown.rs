@@ -32,11 +32,16 @@ impl MarkdownParser {
     }
 
     fn split_body(body: &str) -> (String, String) {
-        match body.find("\n---\n") {
+        match body.rfind("\n---\n") {
             Some(pos) => {
-                let truth = body[..pos].trim().to_string();
                 let timeline = body[pos + 5..].trim().to_string();
-                (truth, timeline)
+                if timeline.is_empty() {
+                    // trailing `---` with nothing after it — treat as part of body, no timeline
+                    (body.trim().to_string(), String::new())
+                } else {
+                    let truth = body[..pos].trim().to_string();
+                    (truth, timeline)
+                }
             }
             None => (body.trim().to_string(), String::new()),
         }
