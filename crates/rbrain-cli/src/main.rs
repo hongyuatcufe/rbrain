@@ -153,6 +153,8 @@ enum Commands {
         depth: u8,
         #[arg(long, default_value = "plain", value_parser = ["plain", "bibtex"], help = "Output format")]
         format: String,
+        #[arg(long, help = "Append bibliography to the page and save it back to the brain")]
+        append: bool,
     },
     /// Hybrid search (vector + keyword + RRF), results grouped by page
     Query {
@@ -773,31 +775,54 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Cite { slug, depth, format } => {
+        Commands::Cite { slug, depth, format, append } => {
             let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             let entries = engine.cite(&slug, depth).await?;
             if entries.is_empty() {
                 println!("No original sources found reachable from '{}'.", slug);
                 println!("Tip: run `rbrain extract --all` to ensure wikilinks are indexed as graph links.");
-            } else if format == "bibtex" {
-                for entry in &entries {
-                    let key = entry.slug.replace('/', "-").replace([' ', '_'], "-");
-                    println!("@misc{{{},", key);
-                    println!("  title = {{{}}},", entry.title);
-                    println!("  note  = {{rbrain: {}}},", entry.slug);
-                    println!("}}");
-                    println!();
-                }
             } else {
-                println!("参考文献\n");
-                for (i, entry) in entries.iter().enumerate() {
-                    println!("[{}] {} — {}", i + 1, entry.title, entry.slug);
-                    if entry.path.len() > 1 {
-                        let path_str = entry.path.join(" → ");
-                        println!("    引用路径：{}", path_str);
+                // Build bibliography text
+                let bib = if format == "bibtex" {
+                    let mut s = String::new();
+                    for entry in &entries {
+                        let key = entry.slug.replace('/', "-").replace([' ', '_'], "-");
+                        s.push_str(&format!("@misc{{{},\n", key));
+                        s.push_str(&format!("  title = {{{}}},\n", entry.title));
+                        s.push_str(&format!("  note  = {{rbrain: {}}},\n", entry.slug));
+                        s.push_str("}\n\n");
                     }
-                    println!();
+                    s
+                } else {
+                    let mut s = String::new();
+                    for (i, entry) in entries.iter().enumerate() {
+                        s.push_str(&format!("[{}] {} — {}\n", i + 1, entry.title, entry.slug));
+                    }
+                    s
+                };
+
+                if append {
+                    let mut page = engine.get_page(&slug).await?;
+                    // Remove any existing 参考文献 section to avoid duplicates
+                    if let Some(pos) = page.compiled_truth.find("\n\n## 参考文献") {
+                        page.compiled_truth.truncate(pos);
+                    }
+                    page.compiled_truth.push_str("\n\n## 参考文献\n\n");
+                    page.compiled_truth.push_str(&bib);
+                    engine.put_page(page).await?;
+                    println!("Bibliography ({} source(s)) appended to '{}'.", entries.len(), slug);
+                } else if format == "bibtex" {
+                    print!("{}", bib);
+                } else {
+                    println!("参考文献\n");
+                    for (i, entry) in entries.iter().enumerate() {
+                        println!("[{}] {} — {}", i + 1, entry.title, entry.slug);
+                        if entry.path.len() > 1 {
+                            println!("    引用路径：{}", entry.path.join(" → "));
+                        }
+                        println!();
+                    }
                 }
             }
         }
