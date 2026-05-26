@@ -360,10 +360,47 @@ rbrain dream --stage extract
 rbrain import <dir>      # import all .md files from directory
 rbrain embed --all       # embed all pages missing vectors
 rbrain embed --stale     # re-embed only stale pages
-rbrain extract --all     # extract [[wikilinks]] from all pages
+rbrain extract --all     # re-index [[wikilinks]] for all pages (writes to DB)
 rbrain sync              # sync filesystem changes → database
 rbrain sync --embed      # sync + re-embed changed pages
 ```
+
+---
+
+## Citation — rbrain cite
+
+Traverse the citation graph from any page and collect all reachable original sources (`raw/` and `note` type pages). Use after completing a draft to generate and attach a bibliography.
+
+```bash
+# Print bibliography (plain)
+rbrain cite research/drafts/my-review --depth 3
+
+# Print as BibTeX
+rbrain cite research/drafts/my-review --depth 3 --format bibtex
+
+# Append bibliography to the page and save (idempotent — replaces existing section)
+rbrain cite research/drafts/my-review --depth 3 --append
+```
+
+**`--depth`** controls graph traversal depth (default 2):
+- depth 2: draft → concepts/synthesis → raw sources
+- depth 3: draft → drafts/synthesis → concepts → raw sources (catches indirect citations)
+
+**`--append`** appends a `## 参考文献` section to the page content and saves it back to the brain. Re-running is safe — the existing section is replaced, not duplicated.
+
+**Standard finishing workflow:**
+```bash
+# 1. Assemble review from drafts, save it
+rbrain put research/drafts/my-review --file assembled.md
+
+# 2. Re-index its wikilinks
+rbrain extract --all
+
+# 3. Append bibliography
+rbrain cite research/drafts/my-review --depth 3 --append
+```
+
+**Note:** `rbrain extract --all` must be run before `cite` if any pages were recently saved — it re-indexes `[[slug | chunk:N]]` wikilinks as graph links, which `cite` traverses.
 
 ---
 
