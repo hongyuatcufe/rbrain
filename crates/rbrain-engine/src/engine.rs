@@ -1680,7 +1680,7 @@ impl Engine {
                 3. 形成有依据的工作判断（注明不确定之处）\
                 4. 列出尚待回答的开放性问题\
                 5. 用Markdown格式，包含：## 核心观点 / ## 张力与矛盾 / ## 工作判断 / ## 开放问题\
-                引用材料时用 [[slug]] 格式标注来源，每个核心论断至少注明一处。";
+                引用材料时用 [[slug | chunk:N]] 格式标注来源（slug 和 chunk 编号来自材料头部标注），每个核心论断至少注明一处。";
             let usr = format!("研究问题：{}\n\n材料：\n\n{}", topic, context);
             (sys, usr)
         } else {
@@ -1691,7 +1691,7 @@ impl Engine {
                 3. Form a working judgment (flagging uncertainty where it exists)\
                 4. List open questions that remain unanswered\
                 Use Markdown with sections: ## Core Claims / ## Tensions & Gaps / ## Working Judgment / ## Open Questions\
-                Cite sources using [[slug]] wikilink format. Each key claim must cite at least one source.";
+                Cite sources using [[slug | chunk:N]] wikilink format (slug and chunk number from the source header). Each key claim must cite at least one source.";
             let usr = format!("Research question: {}\n\nSources:\n\n{}", topic, context);
             (sys, usr)
         };
@@ -2238,7 +2238,7 @@ impl Engine {
         if context.trim().is_empty() {
             return None;
         }
-        let needle: String = context.chars().take(60).collect();
+        let needle: String = context.chars().take(30).collect();
         let rows = sqlx::query("SELECT id, text FROM chunks WHERE page_slug = ?1")
             .bind(page_slug)
             .fetch_all(&self.inner.db)
