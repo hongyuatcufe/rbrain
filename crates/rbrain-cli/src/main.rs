@@ -629,16 +629,16 @@ async fn main() -> anyhow::Result<()> {
 
             if all {
                 let pages = engine.list_pages(None, None).await?;
+                let mut total_links = 0usize;
                 for page in &pages {
                     let full_content = format!("{} {}", page.compiled_truth, page.timeline);
-                    let links = extract_links(&full_content);
-                    if !links.is_empty() {
-                        println!("{}:", page.slug);
-                        for link in links {
-                            println!("  -> {} ({})", link.target_slug, link.edge_type);
-                        }
+                    let count = engine.reindex_page_links(&page.slug, &full_content).await?;
+                    if count > 0 {
+                        println!("{}: {} link(s) indexed", page.slug, count);
+                        total_links += count;
                     }
                 }
+                println!("Done. {} link(s) re-indexed across {} page(s).", total_links, pages.len());
             } else if let Some(s) = slug {
                 let page = engine.get_page(&s).await?;
                 let full_content = format!("{} {}", page.compiled_truth, page.timeline);

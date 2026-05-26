@@ -2702,6 +2702,37 @@ impl Engine {
         ExtractedKnowledge { concepts, figures, events }
     }
 
+    /// Rebuild the link index for a single page from its wikilink content (no re-embed).
+    /// Used by `rbrain extract --all` to repair malformed links after format changes.
+    pub async fn reindex_page_links(&self, slug: &str, content: &str) -> Result<usize> {
+        let normalized = MarkdownParser::normalize_slug(slug);
+        sqlx::query("DELETE FROM links WHERE source_slug = ?1")
+            .bind(&normalized)
+            .execute(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        let links = extract_links(content);
+        let count = links.len();
+        for link in links {
+            let cid = link.chunk_id.unwrap_or(-1);
+            sqlx::query(
+                "INSERT OR IGNORE INTO links \
+                 (source_slug, target_slug, edge_type, context, created_at, chunk_id) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5)",
+            )
+            .bind(&normalized)
+            .bind(&link.target_slug)
+            .bind(&link.edge_type)
+            .bind(&link.context)
+            .bind(cid)
+            .execute(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        }
+        Ok(count)
+    }
+
     /// Traverse the citation graph from a page and collect original source pages (raw/ or notes/).
     /// Returns a deduplicated list of source entries with their traversal path.
     pub async fn cite(&self, slug: &str, depth: u8) -> Result<Vec<CiteEntry>> {
