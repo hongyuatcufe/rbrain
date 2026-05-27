@@ -142,9 +142,69 @@ rbrain 是 gbrain（TypeScript 知识库）的 Rust 移植版本，定位为面�
 
 ---
 
+---
+
+## 2026-05-27 — 安全加固、正确性修复与设计决策
+
+### 已提交功能（commit c5f45d7）
+
+**安全加固**
+- `validated_slug`：拒绝路径穿越（`../`、绝对路径、反斜杠），所有 slug 输入统一走此函数
+- `INSERT ON CONFLICT DO UPDATE` 替换 `INSERT OR REPLACE`，保留原始 `created_at`
+
+**正确性修复**
+- `chunk_and_embed_page`：先获取 embedding 再删除旧 chunk，API 失败时保留可搜索内容
+- links 表加 `is_generated` 列（migration 0011）；re-extract 只删除 `is_generated=1` 的行，保留用户手动创建的边
+- 向量搜索：改为 `score / boost` + ASC 排序（距离语义：越小越相关）；原来 `score * boost` + DESC 是错的
+- `sync_file_to_db`：用 parse/re-serialize 替换 verbatim 覆盖，timeline 正确保留在 timeline 字段
+- `is_derived_research_context`：将过滤范围从 `draft|synthesis|wiki` 扩展到 `concept|figure|evidence|memo`，think 只检索 note/raw 原始文献
+- dream extract：无关联人物的事件路由到 `research/evidence/events/` 而非写入原始文章
+- `extracted_event_rejection_reason`：将 `source_publication_event` 判断收窄为仅 `"期发表"`，避免误拒"顾明远发表重要文章…"类真实学术贡献事件
+
+**新增集成测试**（17 个全部通过）
+- slug 路径穿越拒绝
+- 显式链接跨页面更新存活
+- timeline 往返一致性
+- chunk 失效与 timeline 保留
+- evidence 页面路由（不污染原始文章）
+- 向量搜索最近结果排名
+
+### 系统性代码审查结论（2026-05-27）
+
+对全部改动进行系统性审查，结论如下：
+
+**无问题**：validated_slug 路径防护、embed-before-delete 顺序、ON CONFLICT DO UPDATE 保留 created_at、is_generated 链接删除、fetch_synthesis_sources 来源标注、event_rejection_reason 过滤、audit_citations 两跳查询
+
+**已核实的误判**：两处 indegree boost 实现（apply_backlink_boost 用 `score * boost` + DESC，search_with_context 用 `score / boost` + ASC）因分数语义不同（RRF 分数 vs 向量距离）而设计不同，均正确
+
+**设计观察（不修改）**：
+- `sync_file_to_db` 从 `compiled_truth + timeline` 中提取 wikilink；由于先 DELETE `is_generated=1` 再 INSERT OR IGNORE，每次 sync 后结果与文件内容一致，不是真实 bug
+- Evidence 页面被 `is_derived_research_context` 过滤出 think/generate 检索——设计有意为之，派生内容不参与 AI 检索
+
+### 设计决策：Timeline 功能定位
+
+**结论**：timeline 保留为展示层（人工浏览"学者年谱"），不让其参与 AI 检索。
+
+原因：
+1. 学术文献是静态语料，不是动态事件流；需要的是概念谱系，不是事件追踪
+2. Timeline 是 LLM 跨文章摘要，天然与"引用必须可追溯到原文"的学术要求冲突
+3. gbrain 的设计（时态查询才开放 timeline chunk）对动态个人知识库有意义，对静态文献库收益有限
+4. 完整实现（chunk_source 字段 + 意图分类 + 条件检索）约需 3-4 天，边际收益低
+
+### 设计决策：Citation Graph 方向
+
+学术研究中真正有价值的图谱能力是 **citation graph**（引文关系），而非 timeline（事件关系）。
+
+规划三个层次：
+- **层次 1**（低成本）：改善 think 中 indegree boost 权重，优先计算来自 synthesis/draft 的 `evidence` 类型链接，让高被引基础文献在检索时排名更高。约 10 行 SQL 改动
+- **层次 2**（核心）：在 `dream_extract` 中解析各 note 页面的参考文献节，将能匹配到知识库内页面的引用写入 links 表（`link_type: 'cites'`）。揭示语料库内部引文网络
+- **层次 3**（后续）：think/generate 对 `cites` 入度高的 note 页面加权，让高被引文献自动浮出
+
+---
+
 ## 待办
 
-- [ ] 探讨 dream link 阶段的完善（自动从 synthesis → concept → figure 建立更丰富的图谱）
-- [ ] 考虑对已有 concept/figure 页面补充 language 字段（318 页仍为 unknown）
+- [ ] Citation graph 层次 1：改善 think indegree boost（区分 evidence 链接 vs 其他链接）
+- [ ] Citation graph 层次 2：dream_extract 解析参考文献节，写入 cites 类型链接
 - [ ] MCP 新增工具（brain_think、brain_add_timeline_entry、brain_add_tag、brain_remove_tag、brain_outlinks）的端到端验证
-- [ ] think/generate 覆盖遗漏：concept 页面仍会排在 raw 文章前，--limit 12 时重要作者原文被挤出；考虑 raw 页面排名提升策略或增加默认 limit
+- [ ] 考虑对已有 concept/figure 页面补充 language 字段（部分页面仍为 unknown）
