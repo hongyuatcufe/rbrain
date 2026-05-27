@@ -14,6 +14,7 @@ use sqlx::Row;
 use sqlx::SqlitePool;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use strsim::levenshtein;
@@ -103,12 +104,30 @@ impl Engine {
         self.put_page_inner(page, true).await
     }
 
-    async fn put_page_inner(&self, page: Page, force: bool) -> Result<()> {
+    fn validated_slug(slug: &str) -> Result<String> {
+        let normalized = MarkdownParser::normalize_slug(slug);
+        let path = Path::new(&normalized);
+        if normalized.is_empty()
+            || normalized.contains('\\')
+            || path.components().any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(BrainError::Conflict(format!("invalid page slug: {slug}")));
+        }
+        Ok(normalized)
+    }
+
+    fn page_path(&self, slug: &str) -> Result<(String, PathBuf)> {
+        let normalized = Self::validated_slug(slug)?;
         let repo_path = self
             .inner
             .config
             .repo_dir
-            .join(format!("{}.md", page.slug));
+            .join(format!("{normalized}.md"));
+        Ok((normalized, repo_path))
+    }
+
+    async fn put_page_inner(&self, page: Page, force: bool) -> Result<()> {
+        let (normalized_slug, repo_path) = self.page_path(&page.slug)?;
 
         if !force && repo_path.exists() {
             let existing_content = std::fs::read_to_string(&repo_path)?;
@@ -117,7 +136,7 @@ impl Engine {
             let db_hash: Option<String> = sqlx::query_scalar(
                 "SELECT content_hash FROM pages WHERE slug = ?1",
             )
-            .bind(&page.slug)
+            .bind(&normalized_slug)
             .fetch_optional(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -155,7 +174,6 @@ impl Engine {
             &page.timeline,
         );
         let content_hash = MarkdownParser::content_hash(&canonical);
-        let normalized_slug = MarkdownParser::normalize_slug(&page.slug);
 
         if let Some(parent) = repo_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -168,13 +186,18 @@ impl Engine {
         std::fs::rename(&tmp_path, &repo_path)?;
 
         let tags_json = serde_json::to_string(&page.tags)?;
-        let frontmatter_json = serde_json::to_string(&page.frontmatter)?;
+        let frontmatter_json = serde_json::to_string(&fm)?;
         let language_str = page.language.as_ref().map(|l| l.to_string());
 
         sqlx::query(
-            "INSERT OR REPLACE INTO pages \
+            "INSERT INTO pages \
              (slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now'))",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now')) \
+             ON CONFLICT(slug) DO UPDATE SET \
+             page_type = excluded.page_type, title = excluded.title, tags = excluded.tags, \
+             frontmatter = excluded.frontmatter, compiled_truth = excluded.compiled_truth, \
+             timeline = excluded.timeline, language = excluded.language, \
+             content_hash = excluded.content_hash, updated_at = datetime('now')",
         )
         .bind(&normalized_slug)
         .bind(&page.page_type)
@@ -189,7 +212,7 @@ impl Engine {
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        sqlx::query("DELETE FROM links WHERE source_slug = ?1")
+        sqlx::query("DELETE FROM links WHERE source_slug = ?1 AND is_generated = 1")
             .bind(&normalized_slug)
             .execute(&self.inner.db)
             .await
@@ -211,8 +234,8 @@ impl Engine {
                 .unwrap_or(-1);
             sqlx::query(
                 "INSERT OR IGNORE INTO links \
-                 (source_slug, target_slug, edge_type, context, created_at, chunk_id, source_chunk_idx) \
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, ?6)",
+                 (source_slug, target_slug, edge_type, context, created_at, chunk_id, source_chunk_idx, is_generated) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, ?6, 1)",
             )
             .bind(&normalized_slug)
             .bind(&link.target_slug)
@@ -273,11 +296,30 @@ impl Engine {
             }
         })?;
 
+        let normalized_slug = Self::validated_slug(&page.slug)?;
+        let lang = page.language.clone().unwrap_or(rbrain_core::page::Language::En);
+        let chunker = Chunker::new(&lang);
+        let compiled_truth_chunks = chunker.chunk(&page.compiled_truth, &normalized_slug, &lang);
+        let chunk_texts: Vec<String> = compiled_truth_chunks
+            .iter()
+            .map(|chunk| chunk.text.clone())
+            .collect();
+
+        // Keep the previous searchable version intact when embedding fails.
+        let embeddings = embedder.embed_batch(&chunk_texts).await?;
+        if embeddings.len() != chunk_texts.len() {
+            return Err(BrainError::Conflict(format!(
+                "embedder returned {} vectors for {} chunks",
+                embeddings.len(),
+                chunk_texts.len()
+            )));
+        }
+
         // Remove old chunk vectors before deleting DB records (IDs are lost after DELETE).
         let old_chunk_ids: Vec<i64> = sqlx::query_scalar(
             "SELECT id FROM chunks WHERE page_slug = ?1"
         )
-        .bind(&page.slug)
+        .bind(&normalized_slug)
         .fetch_all(&self.inner.db)
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -296,17 +338,10 @@ impl Engine {
         }
 
         sqlx::query("DELETE FROM chunks WHERE page_slug = ?1")
-            .bind(&page.slug)
+            .bind(&normalized_slug)
             .execute(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        let lang = page.language.clone().unwrap_or(rbrain_core::page::Language::En);
-
-        let chunker = Chunker::new(&lang);
-
-        let compiled_truth_chunks =
-            chunker.chunk(&page.compiled_truth, &page.slug, &lang);
 
         // Timeline content is stored in pages.timeline and displayed via rbrain get.
         // Do NOT embed or index timeline chunks — they are LLM-generated summaries,
@@ -315,8 +350,6 @@ impl Engine {
 
         let mut idx = 0;
         let mut chunk_ids: Vec<i64> = Vec::new();
-        let mut chunk_texts: Vec<String> = Vec::new();
-
         for chunk in compiled_truth_chunks {
             let language_str = chunk.language.to_string();
             // Always 1: we passed only compiled_truth to the chunker, so any --- inside
@@ -340,11 +373,8 @@ impl Engine {
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
             chunk_ids.push(chunk_id);
-            chunk_texts.push(chunk.text);
             idx += 1;
         }
-
-        let embeddings = embedder.embed_batch(&chunk_texts).await?;
 
         let mut vector_items = Vec::new();
         for (chunk_id, embedding) in chunk_ids.iter().zip(embeddings.iter()) {
@@ -369,7 +399,7 @@ impl Engine {
             let chunk_text = chunk_texts.get(chunk_ids.iter().position(|&id| id == *chunk_id).unwrap_or(0))
                 .cloned()
                 .unwrap_or_default();
-            keyword_index.upsert(*chunk_id, &page.slug, &chunk_text, &lang).await?;
+            keyword_index.upsert(*chunk_id, &normalized_slug, &chunk_text, &lang).await?;
         }
 
         vector_store.upsert_batch(&vector_items).await?;
@@ -428,12 +458,7 @@ impl Engine {
     }
 
     pub async fn delete_page(&self, slug: &str) -> Result<()> {
-        let normalized = MarkdownParser::normalize_slug(slug);
-        let repo_path = self
-            .inner
-            .config
-            .repo_dir
-            .join(format!("{}.md", normalized));
+        let (normalized, repo_path) = self.page_path(slug)?;
 
         let chunk_ids: Vec<i64> = sqlx::query_scalar(
             "SELECT id FROM chunks WHERE page_slug = ?1"
@@ -662,8 +687,8 @@ impl Engine {
     }
 
     /// Update the DB record for a file that was edited externally, without
-    /// rewriting the file on disk. The raw file body is stored as compiled_truth
-    /// so that hand-written markdown (including `---` horizontal rules) is preserved.
+    /// rewriting the file on disk. Previously indexed chunks are invalid after a
+    /// file edit and must not remain searchable until the page is re-embedded.
     async fn sync_file_to_db(&self, slug: &str, content: &str, hash: &str) -> Result<()> {
         let parse_result = MarkdownParser::parse(content);
         let fm = &parse_result.frontmatter;
@@ -675,61 +700,55 @@ impl Engine {
             .unwrap_or_default();
         let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
         let language = Some(rbrain_core::page::Language::detect(&parse_result.compiled_truth).to_string());
-        let normalized_slug = MarkdownParser::normalize_slug(slug);
+        let normalized_slug = Self::validated_slug(slug)?;
         let frontmatter_json = serde_json::to_string(fm).unwrap_or_else(|_| "{}".to_string());
 
-        // Store the full body (pre-split) so `---` horizontal rules in hand-written
-        // markdown are not lost. compiled_truth holds the verbatim body text.
-        let body_start = {
-            let mut pos = 0;
-            let bytes = content.as_bytes();
-            if content.starts_with("---") {
-                pos = 3;
-                while pos < bytes.len() {
-                    if bytes[pos] == b'\n' && content[pos+1..].starts_with("---") {
-                        pos += 4;
-                        while pos < bytes.len() && bytes[pos] != b'\n' { pos += 1; }
-                        if pos < bytes.len() { pos += 1; }
-                        break;
-                    }
-                    pos += 1;
-                }
-            }
-            pos
-        };
-        let raw_body = content[body_start..].trim().to_string();
-
         sqlx::query(
-            "INSERT OR REPLACE INTO pages \
+            "INSERT INTO pages \
              (slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7, ?8, \
-                     COALESCE((SELECT created_at FROM pages WHERE slug = ?1), datetime('now')), \
-                     datetime('now'))",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
+                     datetime('now'), datetime('now')) \
+             ON CONFLICT(slug) DO UPDATE SET \
+             page_type = excluded.page_type, title = excluded.title, tags = excluded.tags, \
+             frontmatter = excluded.frontmatter, compiled_truth = excluded.compiled_truth, \
+             timeline = excluded.timeline, language = excluded.language, \
+             content_hash = excluded.content_hash, updated_at = datetime('now')",
         )
         .bind(&normalized_slug)
         .bind(&page_type)
         .bind(&title)
         .bind(&tags_json)
         .bind(&frontmatter_json)
-        .bind(&raw_body)
+        .bind(&parse_result.compiled_truth)
+        .bind(&parse_result.timeline)
         .bind(&language)
         .bind(hash)
         .execute(&self.inner.db)
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        sqlx::query("DELETE FROM links WHERE source_slug = ?1")
+        sqlx::query("DELETE FROM links WHERE source_slug = ?1 AND is_generated = 1")
             .bind(&normalized_slug)
             .execute(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        let links = extract_links(&raw_body);
+        // A synced file no longer corresponds to its previous evidence chunks.
+        // Dropping the rows prevents stale text from being returned and causes
+        // `embed --stale` / `sync --embed` to rebuild the searchable version.
+        sqlx::query("DELETE FROM chunks WHERE page_slug = ?1")
+            .bind(&normalized_slug)
+            .execute(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        let full_content = format!("{} {}", parse_result.compiled_truth, parse_result.timeline);
+        let links = extract_links(&full_content);
         for link in links {
             sqlx::query(
                 "INSERT OR IGNORE INTO links \
-                 (source_slug, target_slug, edge_type, context, created_at, chunk_id) \
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'), -1)",
+                 (source_slug, target_slug, edge_type, context, created_at, chunk_id, is_generated) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), -1, 1)",
             )
             .bind(&normalized_slug)
             .bind(&link.target_slug)
@@ -855,11 +874,12 @@ impl Engine {
 
         // Fetch extra results so filtering doesn't starve the result set
         let raw = keyword_index.search(query, lang, k * 5).await?;
-        if raw.is_empty() || (page_type.is_none() && tag.is_none()) {
-            return Ok(raw.into_iter().take(k).collect());
+        if raw.is_empty() {
+            return Ok(vec![]);
         }
 
-        // Build a filtered set of allowed chunk IDs via SQL
+        // Tantivy entries can outlive DB chunks after a plain filesystem sync.
+        // Always intersect with live chunks before exposing search results.
         let ids: Vec<i64> = raw.iter().map(|(id, _)| *id).collect();
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
@@ -1203,7 +1223,7 @@ impl Engine {
             })?;
 
         let query_embedding = embedder.embed_one(query).await?;
-        let results = vector_store.search(&query_embedding, k).await?;
+        let mut results = vector_store.search(&query_embedding, k).await?;
 
         if results.is_empty() {
             return Ok(results);
@@ -1228,9 +1248,12 @@ impl Engine {
             chunk_to_slug.insert(row.get::<i64, _>("id"), row.get("page_slug"));
         }
 
+        // A saved vector index may still contain IDs invalidated by a non-embedding
+        // sync. Do not surface vectors whose backing chunks no longer exist.
+        results.retain(|(chunk_id, _)| chunk_to_slug.contains_key(chunk_id));
         let unique_slugs: Vec<String> = chunk_to_slug.values().cloned().collect();
         if unique_slugs.is_empty() {
-            return Ok(results);
+            return Ok(vec![]);
         }
 
         let slug_placeholders: String = unique_slugs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
@@ -1257,11 +1280,11 @@ impl Engine {
                 let slug = chunk_to_slug.get(&chunk_id);
                 let indegree = slug.and_then(|s| indegrees.get(s)).copied().unwrap_or(0) as f64;
                 let boost = 1.0 + indegree.ln_1p() * 0.1;
-                (chunk_id, score * boost as f32)
+                (chunk_id, score / boost as f32)
             })
             .collect();
 
-        boosted_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        boosted_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(boosted_results)
     }
@@ -1415,6 +1438,19 @@ impl Engine {
         let target = MarkdownParser::normalize_slug(target_slug);
         let cid = chunk_id.unwrap_or(-1);
 
+        // Promote an extracted edge to an explicit edge when the keys collide.
+        sqlx::query(
+            "DELETE FROM links WHERE source_slug = ?1 AND target_slug = ?2 AND edge_type = ?3 \
+             AND chunk_id = ?4 AND source_chunk_idx = -1 AND is_generated = 1",
+        )
+        .bind(&source)
+        .bind(&target)
+        .bind(edge_type)
+        .bind(cid)
+        .execute(&self.inner.db)
+        .await
+        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
         // Check if a link already exists (explicit links from add_link always have source_chunk_idx = -1)
         let existing_context: Option<String> = sqlx::query_scalar(
             "SELECT context FROM links WHERE source_slug = ?1 AND target_slug = ?2 AND edge_type = ?3 AND chunk_id = ?4 AND source_chunk_idx = -1"
@@ -1542,7 +1578,7 @@ impl Engine {
         text: &str,
         source: Option<&str>,
     ) -> Result<()> {
-        let normalized = MarkdownParser::normalize_slug(slug);
+        let (normalized, repo_path) = self.page_path(slug)?;
         let page = self.get_page(&normalized).await?;
         let entry = if let Some(src) = source {
             format!("- {}: {} [Source: {}]", date, text, src)
@@ -1556,7 +1592,6 @@ impl Engine {
         };
 
         // Write file first; only update DB after filesystem succeeds.
-        let repo_path = self.inner.config.repo_dir.join(format!("{}.md", normalized));
         let new_hash = if repo_path.exists() {
             let canonical = MarkdownParser::to_canonical(&page.frontmatter, &page.compiled_truth, &new_timeline);
             std::fs::write(&repo_path, &canonical)?;
@@ -1593,7 +1628,7 @@ impl Engine {
         content: &str,
         kind: &str,
     ) -> Result<()> {
-        let normalized = MarkdownParser::normalize_slug(slug);
+        let (normalized, repo_path) = self.page_path(slug)?;
         let page = self.get_page(&normalized).await?;
         let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let entry = format!("- [take/{}] {}: {}", kind, date, content);
@@ -1604,7 +1639,6 @@ impl Engine {
         };
 
         // Write file first; only update DB after filesystem succeeds.
-        let repo_path = self.inner.config.repo_dir.join(format!("{}.md", normalized));
         let new_hash = if repo_path.exists() {
             let canonical = MarkdownParser::to_canonical(&page.frontmatter, &page.compiled_truth, &new_timeline);
             std::fs::write(&repo_path, &canonical)?;
@@ -1730,9 +1764,11 @@ impl Engine {
             }
         })?;
 
-        let chunks: Vec<ChunkResult> = self.search_with_context(topic, lang, limit, expand).await?
+        let candidates = limit.saturating_mul(5).max(limit);
+        let chunks: Vec<ChunkResult> = self.search_with_context(topic, lang, candidates, expand).await?
             .into_iter()
-            .filter(|c| !matches!(c.page_type.as_str(), "draft" | "synthesis" | "wiki"))
+            .filter(|c| !is_derived_research_context(&c.page_type))
+            .take(limit)
             .collect();
         if chunks.is_empty() {
             return Ok(format!("No relevant content found in brain for: {}", topic));
@@ -2100,9 +2136,11 @@ impl Engine {
             }
         })?;
 
-        let chunks: Vec<ChunkResult> = self.search_with_context(topic, lang, limit, expand).await?
+        let candidates = limit.saturating_mul(5).max(limit);
+        let chunks: Vec<ChunkResult> = self.search_with_context(topic, lang, candidates, expand).await?
             .into_iter()
-            .filter(|c| !matches!(c.page_type.as_str(), "draft" | "synthesis" | "wiki"))
+            .filter(|c| !is_derived_research_context(&c.page_type))
+            .take(limit)
             .collect();
 
         if chunks.is_empty() {
@@ -2159,8 +2197,23 @@ impl Engine {
 
     async fn write_tags_to_file_and_db(&self, page: &Page) -> Result<()> {
         let tags_json = serde_json::to_string(&page.tags)?;
+        let mut frontmatter = match &page.frontmatter {
+            serde_json::Value::Object(map) => map.clone(),
+            _ => serde_json::Map::new(),
+        };
+        frontmatter.insert(
+            "tags".to_string(),
+            serde_json::Value::Array(
+                page.tags
+                    .iter()
+                    .map(|tag| serde_json::Value::String(tag.clone()))
+                    .collect(),
+            ),
+        );
+        let frontmatter_json =
+            serde_json::to_string(&serde_json::Value::Object(frontmatter))?;
         // Write file first; only update DB after filesystem succeeds.
-        let repo_path = self.inner.config.repo_dir.join(format!("{}.md", page.slug));
+        let (_, repo_path) = self.page_path(&page.slug)?;
         let new_hash = if repo_path.exists() {
             let content = std::fs::read_to_string(&repo_path)?;
             let updated = update_frontmatter_tags(&content, &page.tags);
@@ -2171,8 +2224,11 @@ impl Engine {
             None
         };
 
-        sqlx::query("UPDATE pages SET tags = ?1, updated_at = datetime('now') WHERE slug = ?2")
+        sqlx::query(
+            "UPDATE pages SET tags = ?1, frontmatter = ?2, updated_at = datetime('now') WHERE slug = ?3",
+        )
             .bind(&tags_json)
+            .bind(&frontmatter_json)
             .bind(&page.slug)
             .execute(&self.inner.db)
             .await
@@ -2427,7 +2483,8 @@ impl Engine {
                               - For figures: describe the person by their REAL-WORLD identity (institution, role, field of expertise). NEVER use vague references like '本文作者', 'the author', 'this article's author', '该文作者'. If you can identify them from the text (e.g. affiliation in the abstract), state it; otherwise write their field only (e.g. '教育学研究者，专注高等教育学自主知识体系').\n\
                               - For concepts: describe based on how the text defines or uses it; include the source article slug for attribution.\n\
                               - For concept names: use the shortest canonical form as it appears in the source (e.g., \"自主知识体系\" not \"中国教育学的自主知识体系\"). Do not add qualifiers unless they are part of the established term.\n\
-                              - For events: use ISO date (YYYY-MM-DD or YYYY-MM or YYYY); omit if date is unknown.\n\
+                              - For events: use ISO date (YYYY-MM-DD or YYYY-MM or YYYY) only when the source explicitly gives a date; omit an event if its date is unknown. Never infer the current date.\n\
+                              - For events: exclude document metadata such as received/revised/accepted/publication dates, journal issue publication, acknowledgements, funding or project approval records, and the publication of this source article itself.\n\
                               - For events: if the event is about a specific scholar or person you extracted as a figure, set figure_slug to \"research/figures/<slugified-name>\" (lowercase, spaces→hyphens, keep CJK as-is). If not tied to a person, leave figure_slug as empty string.\n\
                               - Only extract entities with substantive presence in the text (not passing mentions).\n\
                               Your response must be a raw JSON object (no markdown fences) conforming exactly to:\n\
@@ -2547,34 +2604,67 @@ impl Engine {
                 }
             }
             
-            // 3. Save extracted events — route to figure page when figure_slug is set,
-            //    otherwise fall back to the source article page.
-            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            // 3. Save extracted events on a related figure page when possible.
+            // Otherwise preserve them on a derived evidence page. Source notes,
+            // especially raw articles, are immutable evidence and must not receive
+            // generated timeline material.
             for event in &knowledge.events {
                 if event.description.trim().is_empty() {
                     continue;
                 }
-                let date_str = if event.date.trim().is_empty() {
-                    &today
-                } else {
-                    &event.date
-                };
+                if let Some(reason) = extracted_event_rejection_reason(event) {
+                    println!(
+                        "    Skipped timeline event ({}): {}",
+                        reason,
+                        event.description.trim()
+                    );
+                    continue;
+                }
+                let date_str = event.date.trim();
                 let event_src = Some(slug.as_str());
 
-                // Determine target page: figure page if the LLM named one and it exists,
-                // otherwise the source article itself.
-                let target_slug = if !event.figure_slug.trim().is_empty() {
-                    let fig = event.figure_slug.trim();
-                    let fig_exists = sqlx::query_scalar::<_, i64>(
+                let fig = event.figure_slug.trim();
+                let fig_exists = if fig.is_empty() {
+                    false
+                } else {
+                    sqlx::query_scalar::<_, i64>(
                         "SELECT COUNT(*) FROM pages WHERE slug = ?1"
                     )
                     .bind(fig)
                     .fetch_one(&self.inner.db)
                     .await
-                    .unwrap_or(0) > 0;
-                    if fig_exists { fig.to_string() } else { slug.clone() }
+                    .unwrap_or(0) > 0
+                };
+                let target_slug = if fig_exists {
+                    fig.to_string()
                 } else {
-                    slug.clone()
+                    let evidence_slug = format!("research/evidence/events/{}", slug);
+                    let evidence_exists = sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM pages WHERE slug = ?1"
+                    )
+                    .bind(&evidence_slug)
+                    .fetch_one(&self.inner.db)
+                    .await
+                    .unwrap_or(0) > 0;
+                    if !evidence_exists {
+                        let display_title = if title.trim().is_empty() { slug.as_str() } else { title.as_str() };
+                        let body = format!(
+                            "从来源文献 `{}` 自动抽取的时间线证据记录。\n\n\
+                             本页为研究辅助材料，事件表述需回到原文核验。",
+                            slug
+                        );
+                        let mut ep = Page::new(evidence_slug.clone(), "evidence".to_string(), body);
+                        ep.title = format!("事件证据：{}", display_title);
+                        ep.language = Some(rbrain_core::page::Language::detect(&ep.compiled_truth));
+                        self.put_page(ep).await?;
+                        println!("    Created event evidence page: {}", evidence_slug);
+                    }
+                    let link_ctx = if event.context.is_empty() { None } else { Some(event.context.as_str()) };
+                    let chunk_id = self.find_chunk_id_for_context(&slug, &event.context).await;
+                    if let Err(e) = self.add_link(&evidence_slug, &slug, "evidence", link_ctx, chunk_id).await {
+                        eprintln!("    WARN: failed to link event evidence {} to {}: {}", evidence_slug, slug, e);
+                    }
+                    evidence_slug
                 };
 
                 if let Err(e) = self.add_timeline_entry(&target_slug, date_str, &event.description, event_src).await {
@@ -2801,7 +2891,7 @@ impl Engine {
                 date: "2018-10-11".to_string(),
                 description: "BERT model was officially released by Google researchers.".to_string(),
                 context: "本研究针对中文文本分类任务，对比了基于BERT和RoBERTa等不同架构的模型表现。".to_string(),
-                figure_slug: String::new(),
+                figure_slug: "research/figures/bert".to_string(),
             });
         } else {
             let words: Vec<&str> = page.title.split_whitespace().collect();
@@ -2830,8 +2920,8 @@ impl Engine {
     /// Rebuild the link index for a single page from its wikilink content (no re-embed).
     /// Used by `rbrain extract --all` to repair malformed links after format changes.
     pub async fn reindex_page_links(&self, slug: &str, content: &str) -> Result<usize> {
-        let normalized = MarkdownParser::normalize_slug(slug);
-        sqlx::query("DELETE FROM links WHERE source_slug = ?1")
+        let normalized = Self::validated_slug(slug)?;
+        sqlx::query("DELETE FROM links WHERE source_slug = ?1 AND is_generated = 1")
             .bind(&normalized)
             .execute(&self.inner.db)
             .await
@@ -2843,8 +2933,8 @@ impl Engine {
             let cid = link.chunk_id.unwrap_or(-1);
             sqlx::query(
                 "INSERT OR IGNORE INTO links \
-                 (source_slug, target_slug, edge_type, context, created_at, chunk_id) \
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5)",
+                 (source_slug, target_slug, edge_type, context, created_at, chunk_id, is_generated) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, 1)",
             )
             .bind(&normalized)
             .bind(&link.target_slug)
@@ -3332,6 +3422,69 @@ fn clean_json(s: &str) -> &str {
     s.trim()
 }
 
+fn extracted_event_rejection_reason(event: &ExtractedEvent) -> Option<&'static str> {
+    let date = event.date.trim();
+    if date.is_empty() {
+        return Some("missing explicit date");
+    }
+    if !is_iso_event_date(date) {
+        return Some("invalid ISO date");
+    }
+
+    let candidate = format!("{} {}", event.description, event.context).to_lowercase();
+    const DOCUMENT_METADATA_MARKERS: &[&str] = &[
+        "收稿",
+        "修回",
+        "录用",
+        "出版日期",
+        "本文发表",
+        "本文出版",
+        "文章发表",
+        "论文发表",
+        "发表于",
+        "刊发",
+        "刊载",
+        "基金项目",
+        "项目立项",
+        "提供资助",
+        "received",
+        "revised",
+        "accepted",
+        "published in",
+    ];
+    // "期发表" covers "第N卷第M期发表某人的论文" — journal issue publication events.
+    // Do NOT use bare "发表" + "文章/论文": that would also reject genuine intellectual
+    // contribution events like "顾明远发表重要文章，提出...".
+    let source_publication_event = candidate.contains("期发表");
+    if source_publication_event
+        || DOCUMENT_METADATA_MARKERS
+            .iter()
+            .any(|marker| candidate.contains(marker))
+    {
+        return Some("document metadata");
+    }
+
+    None
+}
+
+fn is_derived_research_context(page_type: &str) -> bool {
+    matches!(
+        page_type,
+        "draft" | "synthesis" | "wiki" | "memo" | "concept" | "figure" | "evidence"
+    )
+}
+
+fn is_iso_event_date(date: &str) -> bool {
+    match date.len() {
+        4 => date
+            .parse::<i32>()
+            .is_ok_and(|year| (1..=9999).contains(&year)),
+        7 => chrono::NaiveDate::parse_from_str(&format!("{}-01", date), "%Y-%m-%d").is_ok(),
+        10 => chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok(),
+        _ => false,
+    }
+}
+
 fn slugify(s: &str) -> String {
     s.to_lowercase()
         .chars()
@@ -3343,3 +3496,61 @@ fn slugify(s: &str) -> String {
         .join("-")
 }
 
+#[cfg(test)]
+mod event_filter_tests {
+    use super::{ExtractedEvent, extracted_event_rejection_reason, is_derived_research_context};
+
+    fn event(date: &str, description: &str) -> ExtractedEvent {
+        ExtractedEvent {
+            date: date.to_string(),
+            description: description.to_string(),
+            context: description.to_string(),
+            figure_slug: String::new(),
+        }
+    }
+
+    #[test]
+    fn rejects_undated_and_invalid_dream_events() {
+        assert_eq!(
+            extracted_event_rejection_reason(&event("", "未标明日期的教育史叙述")),
+            Some("missing explicit date")
+        );
+        assert_eq!(
+            extracted_event_rejection_reason(&event("2026-13", "事件")),
+            Some("invalid ISO date")
+        );
+    }
+
+    #[test]
+    fn rejects_document_metadata_but_keeps_substantive_events() {
+        assert_eq!(
+            extracted_event_rejection_reason(&event("2025-10-30", "本文收稿日期")),
+            Some("document metadata")
+        );
+        assert_eq!(
+            extracted_event_rejection_reason(&event("2023", "国家社会科学基金项目立项，为本研究提供资助")),
+            Some("document metadata")
+        );
+        assert_eq!(
+            extracted_event_rejection_reason(&event("2024-11", "《高等教育研究》第45卷第11期发表郝文武、贺璐璐的论文")),
+            Some("document metadata")
+        );
+        assert_eq!(
+            extracted_event_rejection_reason(&event("2022-04-25", "提出建构中国自主的知识体系")),
+            None
+        );
+        assert_eq!(
+            extracted_event_rejection_reason(&event("2016-05-17", "习近平发表重要讲话，提出相关命题")),
+            None
+        );
+    }
+
+    #[test]
+    fn derived_research_pages_are_not_generation_sources() {
+        for page_type in ["draft", "synthesis", "wiki", "memo", "concept", "figure", "evidence"] {
+            assert!(is_derived_research_context(page_type));
+        }
+        assert!(!is_derived_research_context("note"));
+        assert!(!is_derived_research_context("book"));
+    }
+}

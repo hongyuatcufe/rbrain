@@ -574,6 +574,16 @@ async fn list_tools() -> impl IntoResponse {
 
 /// Run the HTTP MCP server
 pub async fn run_http_server(engine: Engine, addr: &str) -> anyhow::Result<()> {
+    let is_loopback = addr
+        .parse::<std::net::SocketAddr>()
+        .map(|socket| socket.ip().is_loopback())
+        .unwrap_or_else(|_| addr.starts_with("localhost:"));
+    if !is_loopback {
+        anyhow::bail!(
+            "HTTP MCP exposes unauthenticated mutation tools; bind to a loopback address such as 127.0.0.1:3456"
+        );
+    }
+
     let state = Arc::new(AppState::new(engine));
 
     let app = Router::new()

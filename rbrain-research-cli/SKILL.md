@@ -332,7 +332,8 @@ rbrain dream --stage synthesize    # Phase 4: synthesize concept clusters
 Reads every `note` page not yet processed, calls DeepSeek to extract:
 - **Concepts** → written to `research/concepts/<slug>` (type: `concept`)
 - **Figures** (scholars/people) → written to `research/figures/<slug>` (type: `figure`)
-- **Timeline events** → routed to the figure page if the event is attributable to a specific scholar; otherwise appended to the source article
+- **Timeline events** → routed to the figure page if attributable to a specific scholar; otherwise written to `research/evidence/events/<source-slug>`
+- **Source immutability** → `raw/` articles are read as evidence but never modified by dream output
 - Links source note → concept/figure with type `related`, anchored to chunk_id where context matches
 - Tracks processed pages in `dream_metadata` table (won't re-process unless cleared)
 

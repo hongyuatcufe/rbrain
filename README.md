@@ -178,9 +178,9 @@ rbrain dream --stage extract        # Phase 3: extract concepts & figures / 提�
 rbrain dream --stage synthesize     # Phase 4: synthesize concept clusters / 概念聚类综合
 ```
 
-**Phase 3 — Extract / 提取阶段**：对每篇未处理的 `note`，调用 DeepSeek 提取概念、学者/人物和时间线事件。自动创建 `concepts/<slug>` 和 `figures/<slug>` 页面，建立源文章 → 概念/人物的 `related` 链接。处理记录写入 `dream_metadata`（幂等，不重复处理）。
+**Phase 3 — Extract / 提取阶段**：对每篇未处理的 `note`，调用 DeepSeek 提取概念、学者/人物和时间线事件。自动创建 `concepts/<slug>` 和 `figures/<slug>` 页面；关联人物的事件写入人物页，其他事件写入 `research/evidence/events/<source-slug>` 派生页。`raw/` 来源文献不会被 dream 改写。处理记录写入 `dream_metadata`（幂等，不重复处理）。
 
-For each unprocessed `note`, calls DeepSeek to extract concepts, figures, and timeline events. Creates `concepts/<slug>` and `figures/<slug>` pages; links source note → concept/figure (`related`). Idempotent via `dream_metadata`.
+For each unprocessed `note`, calls DeepSeek to extract concepts, figures, and timeline events. Events associated with people are written to figure pages; other events are written to derived `research/evidence/events/<source-slug>` pages. Dream never rewrites `raw/` source documents. Idempotent via `dream_metadata`.
 
 **Phase 4 — Synthesize / 综合阶段**：对有 3 篇以上源文章反向链接的概念，自动生成结构化文献综合页面，保存至 `synthesis/<concept-slug>`，并建立 `develops`（→ 概念）和 `evidence`（→ 源文章）链接。源文章更新后自动重新综合。
 
@@ -194,8 +194,11 @@ rbrain 通过 Model Context Protocol 将所有操作暴露给 Claude Code 等 MC
 
 ```bash
 rbrain serve mcp                  # stdio mode (for Claude Code) / stdio 模式
-rbrain serve mcp --http <PORT>    # HTTP mode / HTTP 模式（如 --http 3456）
+rbrain serve mcp --http 127.0.0.1:3456  # local HTTP mode / 本地 HTTP 模式
 ```
+
+HTTP mode exposes mutation tools without authentication and therefore only accepts loopback
+addresses (`127.0.0.1`, `[::1]`, or `localhost`). Do not expose it directly to a network.
 
 ### MCP Tools / MCP 工具列表
 
