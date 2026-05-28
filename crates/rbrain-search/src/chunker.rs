@@ -21,16 +21,16 @@ impl Chunker {
     pub fn new(lang: &Language) -> Self {
         match lang {
             Language::Ja | Language::ZhHans | Language::ZhHant | Language::Ko => Self {
-                target_chars: 400,
-                overlap_chars: 50,
+                target_chars: 600,
+                overlap_chars: 100,
             },
             Language::En => Self {
                 target_chars: 1600,
                 overlap_chars: 200,
             },
             Language::Other(_) => Self {
-                target_chars: 400,
-                overlap_chars: 50,
+                target_chars: 600,
+                overlap_chars: 100,
             },
         }
     }

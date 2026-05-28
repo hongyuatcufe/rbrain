@@ -300,13 +300,27 @@ impl Engine {
         let lang = page.language.clone().unwrap_or(rbrain_core::page::Language::En);
         let chunker = Chunker::new(&lang);
         let compiled_truth_chunks = chunker.chunk(&page.compiled_truth, &normalized_slug, &lang);
+
+        // Prepend page title to each chunk text before embedding so the model
+        // has document context. The stored chunk text remains unchanged — only
+        // the embedding input is enriched. This improves retrieval quality for
+        // short or pronoun-heavy passages that lose meaning without their source.
+        let title_prefix = if page.title.trim().is_empty() {
+            format!("[{}]\n\n", normalized_slug)
+        } else {
+            format!("[{}]\n\n", page.title.trim())
+        };
+        let chunk_texts_for_embed: Vec<String> = compiled_truth_chunks
+            .iter()
+            .map(|chunk| format!("{}{}", title_prefix, chunk.text))
+            .collect();
         let chunk_texts: Vec<String> = compiled_truth_chunks
             .iter()
             .map(|chunk| chunk.text.clone())
             .collect();
 
         // Keep the previous searchable version intact when embedding fails.
-        let embeddings = embedder.embed_batch(&chunk_texts).await?;
+        let embeddings = embedder.embed_batch(&chunk_texts_for_embed).await?;
         if embeddings.len() != chunk_texts.len() {
             return Err(BrainError::Conflict(format!(
                 "embedder returned {} vectors for {} chunks",
@@ -793,12 +807,27 @@ impl Engine {
             let content = std::fs::read_to_string(path)?;
             let hash = MarkdownParser::content_hash(&content);
 
-            let relative = path.strip_prefix(&prefix)
-                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-            let slug = relative.to_string_lossy()
-                .trim_end_matches(".md")
-                .trim()
-                .replace(std::path::MAIN_SEPARATOR, "/");
+            // Prefer repo-root-relative slugs so that `rbrain import raw/articles/`
+            // produces slugs like `raw/articles/foo` rather than just `foo`, which
+            // would cause put_page to scatter files into the project root.
+            // For files outside the repo (external import), fall back to
+            // import-dir-relative path and prepend `raw/` to keep them organised.
+            let repo_canon = self.inner.config.repo_dir.canonicalize()
+                .unwrap_or_else(|_| self.inner.config.repo_dir.clone());
+            let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let slug = if let Ok(rel) = path_canon.strip_prefix(&repo_canon) {
+                rel.to_string_lossy()
+                    .trim_end_matches(".md")
+                    .trim()
+                    .replace(std::path::MAIN_SEPARATOR, "/")
+            } else {
+                let rel = path.strip_prefix(&prefix)
+                    .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                format!("raw/{}", rel.to_string_lossy()
+                    .trim_end_matches(".md")
+                    .trim()
+                    .replace(std::path::MAIN_SEPARATOR, "/"))
+            };
             let normalized = MarkdownParser::normalize_slug(&slug);
 
             let db_hash: Option<String> = sqlx::query_scalar(
@@ -1133,8 +1162,18 @@ impl Engine {
 
         let fused = rrf(all_results, 60.0);
 
-        let boosted = if matches!(intent, Intent::Entity) {
-            self.apply_backlink_boost(&fused).await?
+        // Entity queries: strong boost toward high-indegree pages (specific person/concept lookup).
+        // General queries: gentle boost so foundational papers cited by many synthesis pages
+        //   surface higher. Uses existing page_stats.indegree which reflects wikilink citations
+        //   from synthesis/concept pages — a reasonable proxy for academic importance.
+        // Temporal/Event: no boost (recency or specificity matters more than citation count).
+        let boost_weight = match intent {
+            Intent::Entity  => 0.15,
+            Intent::General => 0.05,
+            _               => 0.0,
+        };
+        let boosted = if boost_weight > 0.0 {
+            self.apply_backlink_boost_weighted(&fused, boost_weight).await?
         } else {
             fused
         };
@@ -1142,7 +1181,7 @@ impl Engine {
         Ok(boosted)
     }
 
-    async fn apply_backlink_boost(&self, results: &[(i64, f64)]) -> Result<Vec<(i64, f64)>> {
+    async fn apply_backlink_boost_weighted(&self, results: &[(i64, f64)], weight: f64) -> Result<Vec<(i64, f64)>> {
         if results.is_empty() {
             return Ok(results.to_vec());
         }
@@ -1194,7 +1233,7 @@ impl Engine {
             .map(|&(chunk_id, score)| {
                 let slug = chunk_to_slug.get(&chunk_id);
                 let indegree = slug.and_then(|s| indegrees.get(s)).copied().unwrap_or(0) as f64;
-                let boost = 1.0 + indegree.ln_1p() * 0.15;
+                let boost = 1.0 + indegree.ln_1p() * weight;
                 (chunk_id, score * boost)
             })
             .collect();
@@ -1356,6 +1395,9 @@ impl Engine {
             .map(|(id, text, slug, pt)| (id, (text, slug, pt)))
             .collect();
 
+        // Per-page deduplication: cap at 2 chunks per source page so a single
+        // document cannot dominate the context window and crowd out other sources.
+        let mut page_chunk_count: HashMap<String, usize> = HashMap::new();
         Ok(ranked
             .into_iter()
             .filter_map(|(id, score)| {
@@ -1366,6 +1408,15 @@ impl Engine {
                     page_slug: slug.clone(),
                     page_type: pt.clone(),
                 })
+            })
+            .filter(|cr| {
+                let count = page_chunk_count.entry(cr.page_slug.clone()).or_insert(0);
+                if *count < 2 {
+                    *count += 1;
+                    true
+                } else {
+                    false
+                }
             })
             .collect())
     }
@@ -2482,7 +2533,7 @@ impl Engine {
                               Rules:\n\
                               - For figures: describe the person by their REAL-WORLD identity (institution, role, field of expertise). NEVER use vague references like '本文作者', 'the author', 'this article's author', '该文作者'. If you can identify them from the text (e.g. affiliation in the abstract), state it; otherwise write their field only (e.g. '教育学研究者，专注高等教育学自主知识体系').\n\
                               - For concepts: describe based on how the text defines or uses it; include the source article slug for attribution.\n\
-                              - For concept names: use the shortest canonical form as it appears in the source (e.g., \"自主知识体系\" not \"中国教育学的自主知识体系\"). Do not add qualifiers unless they are part of the established term.\n\
+                              - For concept names: use the shortest canonical form as it appears in the source (e.g., \"知识体系\" not \"某领域的知识体系构建研究\"). Do not add qualifiers unless they are part of the established term. If you see an \"Already-known concepts\" list in the user message, match against it first — prefer the exact existing name over a new variant.\n\
                               - For events: use ISO date (YYYY-MM-DD or YYYY-MM or YYYY) only when the source explicitly gives a date; omit an event if its date is unknown. Never infer the current date.\n\
                               - For events: exclude document metadata such as received/revised/accepted/publication dates, journal issue publication, acknowledgements, funding or project approval records, and the publication of this source article itself.\n\
                               - For events: if the event is about a specific scholar or person you extracted as a figure, set figure_slug to \"research/figures/<slugified-name>\" (lowercase, spaces→hyphens, keep CJK as-is). If not tied to a person, leave figure_slug as empty string.\n\
@@ -2500,8 +2551,24 @@ impl Engine {
                                 ]\n\
                               }";
 
+                // Fetch existing concept titles so LLM can normalize to known names
+                let existing_concepts: Vec<String> = sqlx::query_scalar(
+                    "SELECT title FROM pages WHERE page_type = 'concept' AND title != '' ORDER BY title"
+                )
+                .fetch_all(&self.inner.db)
+                .await
+                .unwrap_or_default();
+
                 let display_title = if title.trim().is_empty() { slug.as_str() } else { title.as_str() };
-                let user = format!("Source slug: {}\nTitle: {}\nType: {}\n\nContent:\n{}", slug, display_title, page_type, compiled_truth);
+                let known_concepts_block = if existing_concepts.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\n\nAlready-known concepts (if a concept you extract is semantically equivalent to one of these, use that EXACT name — do NOT create a variant):\n{}",
+                        existing_concepts.iter().map(|s| format!("- {}", s)).collect::<Vec<_>>().join("\n")
+                    )
+                };
+                let user = format!("Source slug: {}\nTitle: {}\nType: {}{}\n\nContent:\n{}", slug, display_title, page_type, known_concepts_block, compiled_truth);
                 match client.chat(system, &user).await {
                     Ok(resp) => {
                         let cleaned = clean_json(&resp);
