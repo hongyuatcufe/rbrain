@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "research_run frontmatter",
+  "type": "object",
+  "required": ["run_id", "status"],
+  "properties": {
+    "type": { "const": "research_run" },
+    "title": { "type": "string" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "status": {
+      "type": "string",
+      "enum": ["planned", "running", "validating", "complete", "blocked"]
+    },
+    "run_kind": {
+      "type": "string",
+      "enum": [
+        "literature_review",
+        "journal_brief",
+        "hotspot_report",
+        "paper_drafting",
+        "quantitative_analysis",
+        "recommendation_push",
+        "mixed_methods",
+        "theory_building",
+        "research_design",
+        "custom"
+      ]
+    },
+    "created_by": { "type": "string" },
+    "started_at": { "type": "string" },
+    "updated_at": { "type": "string" }
+  }
+}

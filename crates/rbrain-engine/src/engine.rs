@@ -4,23 +4,28 @@ use rbrain_core::error::{BrainError, Result};
 use rbrain_core::keyword_index::KeywordIndex;
 use rbrain_core::markdown::MarkdownParser;
 use rbrain_core::page::Page;
+use rbrain_core::schema::{EdgeType, PageSchema, PageType, TimelineEntry, TimelineSource};
 use rbrain_core::vector_store::VectorStore;
 use rbrain_llm::{DeepSeekClient, Intent};
 use rbrain_search::chunker::Chunker;
 use rbrain_search::keyword_index::TantivyIndex;
 use rbrain_search::rrf;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::SqlitePool;
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use strsim::levenshtein;
 use walkdir::WalkDir;
 
-use crate::links::{extract_links, LinkRef};
+use crate::evidence::{
+    ValidatorResult, artifact_hash_present, finding_has_supporting_evidence,
+    produced_artifact_exists, research_run_has_input,
+};
+use crate::links::{LinkRef, extract_links};
 
 #[derive(Clone)]
 pub struct Engine {
@@ -52,7 +57,9 @@ impl Engine {
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        let deepseek = DeepSeekClient::from_config(&config.deepseek).ok().map(Arc::new);
+        let deepseek = DeepSeekClient::from_config(&config.deepseek)
+            .ok()
+            .map(Arc::new);
 
         let keyword_index = Arc::new(TantivyIndex::new(config.tantivy_dir.clone())?);
 
@@ -82,7 +89,9 @@ impl Engine {
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        let deepseek = DeepSeekClient::from_config(&config.deepseek).ok().map(Arc::new);
+        let deepseek = DeepSeekClient::from_config(&config.deepseek)
+            .ok()
+            .map(Arc::new);
 
         Ok(Self {
             inner: Arc::new(EngineInner {
@@ -97,49 +106,22 @@ impl Engine {
     }
 
     pub async fn put_page(&self, page: Page) -> Result<()> {
-        self.put_page_inner(page, false).await
-    }
+        PageSchema::validate_frontmatter(&page.page_type, &page.frontmatter)?;
 
-    pub async fn put_page_force(&self, page: Page) -> Result<()> {
-        self.put_page_inner(page, true).await
-    }
+        let repo_path = self.inner.config.repo_dir.join(format!("{}.md", page.slug));
 
-    fn validated_slug(slug: &str) -> Result<String> {
-        let normalized = MarkdownParser::normalize_slug(slug);
-        let path = Path::new(&normalized);
-        if normalized.is_empty()
-            || normalized.contains('\\')
-            || path.components().any(|component| !matches!(component, Component::Normal(_)))
-        {
-            return Err(BrainError::Conflict(format!("invalid page slug: {slug}")));
-        }
-        Ok(normalized)
-    }
-
-    fn page_path(&self, slug: &str) -> Result<(String, PathBuf)> {
-        let normalized = Self::validated_slug(slug)?;
-        let repo_path = self
-            .inner
-            .config
-            .repo_dir
-            .join(format!("{normalized}.md"));
-        Ok((normalized, repo_path))
-    }
-
-    async fn put_page_inner(&self, page: Page, force: bool) -> Result<()> {
-        let (normalized_slug, repo_path) = self.page_path(&page.slug)?;
-
-        if !force && repo_path.exists() {
+        if repo_path.exists() {
             let existing_content = std::fs::read_to_string(&repo_path)?;
             let existing_hash = MarkdownParser::content_hash(&existing_content);
 
-            let db_hash: Option<String> = sqlx::query_scalar(
-                "SELECT content_hash FROM pages WHERE slug = ?1",
-            )
-            .bind(&normalized_slug)
-            .fetch_optional(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            let db_hash: Option<String> =
+                sqlx::query_scalar("SELECT content_hash FROM pages WHERE slug = ?1")
+                    .bind(&page.slug)
+                    .fetch_optional(&self.inner.db)
+                    .await
+                    .map_err(|e| {
+                        BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
 
             if let Some(hash) = db_hash {
                 if hash != existing_hash {
@@ -150,30 +132,10 @@ impl Engine {
             }
         }
 
-        // Ensure frontmatter reflects current page fields (type, title, tags).
-        // Page::new() starts with an empty frontmatter; programmatic callers set fields
-        // on the struct but not the frontmatter Value, so we merge them here.
-        let fm = {
-            let mut m = match &page.frontmatter {
-                serde_json::Value::Object(map) => map.clone(),
-                _ => serde_json::Map::new(),
-            };
-            m.insert("type".to_string(), serde_json::Value::String(page.page_type.clone()));
-            if !page.title.is_empty() {
-                m.insert("title".to_string(), serde_json::Value::String(page.title.clone()));
-            }
-            let tags_val: Vec<serde_json::Value> = page.tags.iter()
-                .map(|t| serde_json::Value::String(t.clone()))
-                .collect();
-            m.insert("tags".to_string(), serde_json::Value::Array(tags_val));
-            serde_json::Value::Object(m)
-        };
-        let canonical = MarkdownParser::to_canonical(
-            &fm,
-            &page.compiled_truth,
-            &page.timeline,
-        );
+        let canonical =
+            MarkdownParser::to_canonical(&page.frontmatter, &page.compiled_truth, &page.timeline);
         let content_hash = MarkdownParser::content_hash(&canonical);
+        let normalized_slug = MarkdownParser::normalize_slug(&page.slug);
 
         if let Some(parent) = repo_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -186,18 +148,13 @@ impl Engine {
         std::fs::rename(&tmp_path, &repo_path)?;
 
         let tags_json = serde_json::to_string(&page.tags)?;
-        let frontmatter_json = serde_json::to_string(&fm)?;
+        let frontmatter_json = serde_json::to_string(&page.frontmatter)?;
         let language_str = page.language.as_ref().map(|l| l.to_string());
 
         sqlx::query(
-            "INSERT INTO pages \
-             (slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now')) \
-             ON CONFLICT(slug) DO UPDATE SET \
-             page_type = excluded.page_type, title = excluded.title, tags = excluded.tags, \
-             frontmatter = excluded.frontmatter, compiled_truth = excluded.compiled_truth, \
-             timeline = excluded.timeline, language = excluded.language, \
-             content_hash = excluded.content_hash, updated_at = datetime('now')",
+            "INSERT OR REPLACE INTO pages \
+             (slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, schema_version, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'), datetime('now'))",
         )
         .bind(&normalized_slug)
         .bind(&page.page_type)
@@ -208,41 +165,28 @@ impl Engine {
         .bind(&page.timeline)
         .bind(&language_str)
         .bind(&content_hash)
+        .bind(PageSchema::CURRENT_VERSION)
         .execute(&self.inner.db)
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        sqlx::query("DELETE FROM links WHERE source_slug = ?1 AND is_generated = 1")
+        sqlx::query("DELETE FROM links WHERE source_slug = ?1")
             .bind(&normalized_slug)
             .execute(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        let full_content = format!("{} {}", page.compiled_truth, page.timeline);
-        let links = extract_links(&full_content);
-
-        // Determine source_chunk_idx for each link by simulating chunking of compiled_truth.
-        let link_lang = page.language.clone().unwrap_or(rbrain_core::page::Language::En);
-        let link_chunker = rbrain_search::chunker::Chunker::new(&link_lang);
-        let ct_chunks = link_chunker.chunk(&page.compiled_truth, &normalized_slug, &link_lang);
-
+        let links = extract_links(&page.compiled_truth);
         for link in links {
-            let cid = link.chunk_id.unwrap_or(-1);
-            let src_idx = ct_chunks.iter()
-                .find(|c| c.text.contains(link.target_slug.as_str()))
-                .map(|c| c.chunk_idx as i64)
-                .unwrap_or(-1);
             sqlx::query(
                 "INSERT OR IGNORE INTO links \
-                 (source_slug, target_slug, edge_type, context, created_at, chunk_id, source_chunk_idx, is_generated) \
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, ?6, 1)",
+                 (source_slug, target_slug, edge_type, context, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'))",
             )
             .bind(&normalized_slug)
             .bind(&link.target_slug)
             .bind(&link.edge_type)
             .bind(&link.context)
-            .bind(cid)
-            .bind(src_idx)
             .execute(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -261,7 +205,7 @@ impl Engine {
 
         sqlx::query(
             "INSERT INTO jobs (queue, name, params, status, priority, depth, created_at) \
-             VALUES ('default', 'embed_page', ?1, 'pending', 0, 0, datetime('now'))"
+             VALUES ('default', 'embed_page', ?1, 'pending', 0, 0, datetime('now'))",
         )
         .bind(&params_str)
         .execute(&self.inner.db)
@@ -277,99 +221,60 @@ impl Engine {
     }
 
     pub async fn chunk_and_embed_page(&self, page: &Page) -> Result<()> {
-        let embedder = self.inner.embedder.as_ref().ok_or_else(|| {
-            BrainError::ApiUnreachable {
+        let embedder = self
+            .inner
+            .embedder
+            .as_ref()
+            .ok_or_else(|| BrainError::ApiUnreachable {
                 provider: "embedder".to_string(),
                 message: "Embedder not configured — run with a search-enabled engine".to_string(),
-            }
-        })?;
-        let vector_store = self.inner.vector_store.as_ref().ok_or_else(|| {
-            BrainError::ApiUnreachable {
-                provider: "vector_store".to_string(),
-                message: "Vector store not configured".to_string(),
-            }
-        })?;
-        let keyword_index = self.inner.keyword_index.as_ref().ok_or_else(|| {
-            BrainError::ApiUnreachable {
-                provider: "keyword_index".to_string(),
-                message: "Keyword index not configured".to_string(),
-            }
-        })?;
-
-        let normalized_slug = Self::validated_slug(&page.slug)?;
-        let lang = page.language.clone().unwrap_or(rbrain_core::page::Language::En);
-        let chunker = Chunker::new(&lang);
-        let compiled_truth_chunks = chunker.chunk(&page.compiled_truth, &normalized_slug, &lang);
-
-        // Prepend page title to each chunk text before embedding so the model
-        // has document context. The stored chunk text remains unchanged — only
-        // the embedding input is enriched. This improves retrieval quality for
-        // short or pronoun-heavy passages that lose meaning without their source.
-        let title_prefix = if page.title.trim().is_empty() {
-            format!("[{}]\n\n", normalized_slug)
-        } else {
-            format!("[{}]\n\n", page.title.trim())
-        };
-        let chunk_texts_for_embed: Vec<String> = compiled_truth_chunks
-            .iter()
-            .map(|chunk| format!("{}{}", title_prefix, chunk.text))
-            .collect();
-        let chunk_texts: Vec<String> = compiled_truth_chunks
-            .iter()
-            .map(|chunk| chunk.text.clone())
-            .collect();
-
-        // Keep the previous searchable version intact when embedding fails.
-        let embeddings = embedder.embed_batch(&chunk_texts_for_embed).await?;
-        if embeddings.len() != chunk_texts.len() {
-            return Err(BrainError::Conflict(format!(
-                "embedder returned {} vectors for {} chunks",
-                embeddings.len(),
-                chunk_texts.len()
-            )));
-        }
-
-        // Remove old chunk vectors before deleting DB records (IDs are lost after DELETE).
-        let old_chunk_ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM chunks WHERE page_slug = ?1"
-        )
-        .bind(&normalized_slug)
-        .fetch_all(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        if !old_chunk_ids.is_empty() {
-            if let Some(vs) = &self.inner.vector_store {
-                for id in &old_chunk_ids {
-                    let _ = vs.delete(*id).await;
-                }
-            }
-            if let Some(ki) = &self.inner.keyword_index {
-                for id in &old_chunk_ids {
-                    let _ = ki.delete(*id).await;
-                }
-            }
-        }
+            })?;
+        let vector_store =
+            self.inner
+                .vector_store
+                .as_ref()
+                .ok_or_else(|| BrainError::ApiUnreachable {
+                    provider: "vector_store".to_string(),
+                    message: "Vector store not configured".to_string(),
+                })?;
+        let keyword_index =
+            self.inner
+                .keyword_index
+                .as_ref()
+                .ok_or_else(|| BrainError::ApiUnreachable {
+                    provider: "keyword_index".to_string(),
+                    message: "Keyword index not configured".to_string(),
+                })?;
 
         sqlx::query("DELETE FROM chunks WHERE page_slug = ?1")
-            .bind(&normalized_slug)
+            .bind(&page.slug)
             .execute(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        // Timeline content is stored in pages.timeline and displayed via rbrain get.
-        // Do NOT embed or index timeline chunks — they are LLM-generated summaries,
-        // not original text, and pollute semantic search causing think to cite them
-        // instead of the original compiled_truth chunks.
+        let lang = page
+            .language
+            .clone()
+            .unwrap_or(rbrain_core::page::Language::En);
+
+        let chunker = Chunker::new(&lang);
+
+        let compiled_truth_chunks = chunker.chunk(&page.compiled_truth, &page.slug, &lang);
+
+        let title_prefix = if page.title.trim().is_empty() {
+            format!("[{}]\n\n", page.slug)
+        } else {
+            format!("[{}]\n\n", page.title.trim())
+        };
 
         let mut idx = 0;
         let mut chunk_ids: Vec<i64> = Vec::new();
+        let mut chunk_texts: Vec<String> = Vec::new();
+        let mut embedding_inputs: Vec<String> = Vec::new();
+
         for chunk in compiled_truth_chunks {
             let language_str = chunk.language.to_string();
-            // Always 1: we passed only compiled_truth to the chunker, so any --- inside
-            // (markdown HR in LLM output, or concept-page definition separators) must not
-            // flip the flag — the entire compiled_truth section is citable content.
-            let is_compiled_truth: i32 = 1;
+            let is_compiled_truth = if chunk.is_compiled_truth { 1 } else { 0 };
 
             let chunk_id: i64 = sqlx::query_scalar(
                 "INSERT INTO chunks \
@@ -387,8 +292,17 @@ impl Engine {
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
             chunk_ids.push(chunk_id);
+            embedding_inputs.push(format!("{}{}", title_prefix, chunk.text));
+            chunk_texts.push(chunk.text);
             idx += 1;
         }
+
+        if chunk_ids.is_empty() {
+            keyword_index.commit().await?;
+            return Ok(());
+        }
+
+        let embeddings = embedder.embed_batch(&embedding_inputs).await?;
 
         let mut vector_items = Vec::new();
         for (chunk_id, embedding) in chunk_ids.iter().zip(embeddings.iter()) {
@@ -410,10 +324,18 @@ impl Engine {
 
             vector_items.push((*chunk_id, embedding.clone()));
 
-            let chunk_text = chunk_texts.get(chunk_ids.iter().position(|&id| id == *chunk_id).unwrap_or(0))
+            let chunk_text = chunk_texts
+                .get(
+                    chunk_ids
+                        .iter()
+                        .position(|&id| id == *chunk_id)
+                        .unwrap_or(0),
+                )
                 .cloned()
                 .unwrap_or_default();
-            keyword_index.upsert(*chunk_id, &normalized_slug, &chunk_text, &lang).await?;
+            keyword_index
+                .upsert(*chunk_id, &page.slug, &chunk_text, &lang)
+                .await?;
         }
 
         vector_store.upsert_batch(&vector_items).await?;
@@ -436,7 +358,7 @@ impl Engine {
         let normalized = MarkdownParser::normalize_slug(slug);
 
         let row = sqlx::query(
-            "SELECT slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, created_at, updated_at \
+            "SELECT slug, page_type, title, tags, frontmatter, compiled_truth, timeline, schema_version, language, content_hash, created_at, updated_at \
              FROM pages WHERE slug = ?1",
         )
         .bind(&normalized)
@@ -460,6 +382,7 @@ impl Engine {
             frontmatter,
             compiled_truth: row.get("compiled_truth"),
             timeline: row.get("timeline"),
+            schema_version: row.get("schema_version"),
             language,
             content_hash: row.get("content_hash"),
             created_at: row.get("created_at"),
@@ -472,26 +395,34 @@ impl Engine {
     }
 
     pub async fn delete_page(&self, slug: &str) -> Result<()> {
-        let (normalized, repo_path) = self.page_path(slug)?;
+        let normalized = MarkdownParser::normalize_slug(slug);
+        let repo_path = self
+            .inner
+            .config
+            .repo_dir
+            .join(format!("{}.md", normalized));
 
-        let chunk_ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM chunks WHERE page_slug = ?1"
-        )
-        .bind(&normalized)
-        .fetch_all(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        // Delete from DB first — if index cleanup fails, the page is gone from DB
-        // (clean state). Stale index entries are harmless: searches hit the DB to
-        // verify existence and will skip them.
-        sqlx::query("DELETE FROM chunks WHERE page_slug = ?1")
+        let chunk_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM chunks WHERE page_slug = ?1")
             .bind(&normalized)
-            .execute(&self.inner.db)
+            .fetch_all(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        sqlx::query("DELETE FROM links WHERE source_slug = ?1 OR target_slug = ?1")
+        if let Some(vector_store) = &self.inner.vector_store {
+            for chunk_id in &chunk_ids {
+                vector_store.delete(*chunk_id).await?;
+            }
+            vector_store.save().await?;
+        }
+
+        if let Some(keyword_index) = &self.inner.keyword_index {
+            for chunk_id in &chunk_ids {
+                keyword_index.delete(*chunk_id).await?;
+            }
+            keyword_index.commit().await?;
+        }
+
+        sqlx::query("DELETE FROM chunks WHERE page_slug = ?1")
             .bind(&normalized)
             .execute(&self.inner.db)
             .await
@@ -507,20 +438,6 @@ impl Engine {
             std::fs::remove_file(&repo_path)?;
         }
 
-        if let Some(vector_store) = &self.inner.vector_store {
-            for chunk_id in &chunk_ids {
-                let _ = vector_store.delete(*chunk_id).await;
-            }
-            let _ = vector_store.save().await;
-        }
-
-        if let Some(keyword_index) = &self.inner.keyword_index {
-            for chunk_id in &chunk_ids {
-                let _ = keyword_index.delete(*chunk_id).await;
-            }
-            let _ = keyword_index.commit().await;
-        }
-
         Ok(())
     }
 
@@ -529,42 +446,33 @@ impl Engine {
         page_type: Option<&str>,
         tag: Option<&str>,
     ) -> Result<Vec<Page>> {
-        const BASE: &str = "SELECT slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, created_at, updated_at FROM pages";
+        let mut query = String::from(
+            "SELECT slug, page_type, title, tags, frontmatter, compiled_truth, timeline, schema_version, language, content_hash, created_at, updated_at FROM pages",
+        );
+        let mut conditions = Vec::new();
 
-        let rows = match (page_type, tag) {
-            (Some(pt), Some(tg)) => {
-                let tag_pattern = format!("%{}%", tg);
-                sqlx::query(&format!("{} WHERE page_type = ?1 AND tags LIKE ?2 ORDER BY updated_at DESC", BASE))
-                    .bind(pt)
-                    .bind(tag_pattern)
-                    .fetch_all(&self.inner.db)
-                    .await
-            }
-            (Some(pt), None) => {
-                sqlx::query(&format!("{} WHERE page_type = ?1 ORDER BY updated_at DESC", BASE))
-                    .bind(pt)
-                    .fetch_all(&self.inner.db)
-                    .await
-            }
-            (None, Some(tg)) => {
-                let tag_pattern = format!("%{}%", tg);
-                sqlx::query(&format!("{} WHERE tags LIKE ?1 ORDER BY updated_at DESC", BASE))
-                    .bind(tag_pattern)
-                    .fetch_all(&self.inner.db)
-                    .await
-            }
-            (None, None) => {
-                sqlx::query(&format!("{} ORDER BY updated_at DESC", BASE))
-                    .fetch_all(&self.inner.db)
-                    .await
-            }
+        if let Some(t) = page_type {
+            conditions.push(format!("page_type = '{}'", t.replace('\'', "''")));
         }
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        if let Some(t) = tag {
+            conditions.push(format!("tags LIKE '%{}%'", t.replace('\'', "''")));
+        }
+
+        if !conditions.is_empty() {
+            query.push_str(" WHERE ");
+            query.push_str(&conditions.join(" AND "));
+        }
+
+        query.push_str(" ORDER BY updated_at DESC");
+
+        let rows = sqlx::query(&query)
+            .fetch_all(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let mut pages = Vec::new();
         for row in rows {
-            let tags: Vec<String> =
-                serde_json::from_str(row.get::<String, _>("tags").as_str())?;
+            let tags: Vec<String> = serde_json::from_str(row.get::<String, _>("tags").as_str())?;
             let frontmatter: serde_json::Value =
                 serde_json::from_str(row.get::<String, _>("frontmatter").as_str())?;
             let language = row
@@ -579,6 +487,7 @@ impl Engine {
                 frontmatter,
                 compiled_truth: row.get("compiled_truth"),
                 timeline: row.get("timeline"),
+                schema_version: row.get("schema_version"),
                 language,
                 content_hash: row.get("content_hash"),
                 created_at: row.get("created_at"),
@@ -588,7 +497,6 @@ impl Engine {
 
         Ok(pages)
     }
-
 
     pub async fn find_page_fuzzy(&self, slug: &str) -> Result<(Page, f64)> {
         let normalized = MarkdownParser::normalize_slug(slug);
@@ -644,49 +552,87 @@ impl Engine {
 
         for entry in WalkDir::new(repo_dir)
             .into_iter()
-            .filter_entry(|e| {
-                // Skip hidden directories and common non-content directories
-                let name = e.file_name().to_string_lossy();
-                if e.file_type().is_dir() {
-                    !name.starts_with('.') && name != "node_modules" && name != "__pycache__"
-                        && name != "target" && name != "dist" && name != "build"
-                        && !name.ends_with(".dist-info") && !name.ends_with(".data")
-                } else {
-                    true
-                }
-            })
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
         {
             let path = entry.path();
-            let relative = path.strip_prefix(repo_dir)
+            let relative = path
+                .strip_prefix(repo_dir)
                 .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-            let slug = relative.to_string_lossy()
+            let slug = relative
+                .to_string_lossy()
                 .trim_end_matches(".md")
                 .replace(std::path::MAIN_SEPARATOR, "/");
 
             let content = std::fs::read_to_string(path)?;
             let hash = MarkdownParser::content_hash(&content);
 
-            let db_hash: Option<String> = sqlx::query_scalar(
-                "SELECT content_hash FROM pages WHERE slug = ?"
-            )
-            .bind(&slug)
-            .fetch_optional(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            let db_hash: Option<String> =
+                sqlx::query_scalar("SELECT content_hash FROM pages WHERE slug = ?")
+                    .bind(&slug)
+                    .fetch_optional(&self.inner.db)
+                    .await
+                    .map_err(|e| {
+                        BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
 
             match db_hash {
                 Some(existing_hash) if existing_hash == hash => {
                     db_slug_set.remove(&slug);
                 }
                 Some(_) => {
-                    self.sync_file_to_db(&slug, &content, &hash).await?;
+                    let parse_result = MarkdownParser::parse(&content);
+                    let mut page = Page::new(
+                        MarkdownParser::normalize_slug(&slug),
+                        parse_result
+                            .frontmatter
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("note")
+                            .to_string(),
+                        parse_result.compiled_truth.clone(),
+                    );
+                    page.timeline = parse_result.timeline;
+                    page.frontmatter = parse_result.frontmatter;
+                    if let Some(t) = page.frontmatter.get("title").and_then(|v| v.as_str()) {
+                        page.title = t.to_string();
+                    }
+                    if let Some(tags_val) = page.frontmatter.get("tags").and_then(|v| v.as_array())
+                    {
+                        page.tags = tags_val
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect();
+                    }
+                    self.put_page(page).await?;
                     updated.push(slug.clone());
                     db_slug_set.remove(&slug);
                 }
                 None => {
-                    self.sync_file_to_db(&slug, &content, &hash).await?;
+                    let parse_result = MarkdownParser::parse(&content);
+                    let mut page = Page::new(
+                        MarkdownParser::normalize_slug(&slug),
+                        parse_result
+                            .frontmatter
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("note")
+                            .to_string(),
+                        parse_result.compiled_truth.clone(),
+                    );
+                    page.timeline = parse_result.timeline;
+                    page.frontmatter = parse_result.frontmatter;
+                    if let Some(t) = page.frontmatter.get("title").and_then(|v| v.as_str()) {
+                        page.title = t.to_string();
+                    }
+                    if let Some(tags_val) = page.frontmatter.get("tags").and_then(|v| v.as_array())
+                    {
+                        page.tags = tags_val
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect();
+                    }
+                    self.put_page(page).await?;
                     imported.push(slug.clone());
                     db_slug_set.remove(&slug);
                 }
@@ -698,82 +644,6 @@ impl Engine {
         }
 
         Ok((imported, updated, orphaned))
-    }
-
-    /// Update the DB record for a file that was edited externally, without
-    /// rewriting the file on disk. Previously indexed chunks are invalid after a
-    /// file edit and must not remain searchable until the page is re-embedded.
-    async fn sync_file_to_db(&self, slug: &str, content: &str, hash: &str) -> Result<()> {
-        let parse_result = MarkdownParser::parse(content);
-        let fm = &parse_result.frontmatter;
-        let page_type = fm.get("type").and_then(|v| v.as_str()).unwrap_or("note").to_string();
-        let title = fm.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let tags: Vec<String> = fm.get("tags")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-            .unwrap_or_default();
-        let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
-        let language = Some(rbrain_core::page::Language::detect(&parse_result.compiled_truth).to_string());
-        let normalized_slug = Self::validated_slug(slug)?;
-        let frontmatter_json = serde_json::to_string(fm).unwrap_or_else(|_| "{}".to_string());
-
-        sqlx::query(
-            "INSERT INTO pages \
-             (slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
-                     datetime('now'), datetime('now')) \
-             ON CONFLICT(slug) DO UPDATE SET \
-             page_type = excluded.page_type, title = excluded.title, tags = excluded.tags, \
-             frontmatter = excluded.frontmatter, compiled_truth = excluded.compiled_truth, \
-             timeline = excluded.timeline, language = excluded.language, \
-             content_hash = excluded.content_hash, updated_at = datetime('now')",
-        )
-        .bind(&normalized_slug)
-        .bind(&page_type)
-        .bind(&title)
-        .bind(&tags_json)
-        .bind(&frontmatter_json)
-        .bind(&parse_result.compiled_truth)
-        .bind(&parse_result.timeline)
-        .bind(&language)
-        .bind(hash)
-        .execute(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        sqlx::query("DELETE FROM links WHERE source_slug = ?1 AND is_generated = 1")
-            .bind(&normalized_slug)
-            .execute(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        // A synced file no longer corresponds to its previous evidence chunks.
-        // Dropping the rows prevents stale text from being returned and causes
-        // `embed --stale` / `sync --embed` to rebuild the searchable version.
-        sqlx::query("DELETE FROM chunks WHERE page_slug = ?1")
-            .bind(&normalized_slug)
-            .execute(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        let full_content = format!("{} {}", parse_result.compiled_truth, parse_result.timeline);
-        let links = extract_links(&full_content);
-        for link in links {
-            sqlx::query(
-                "INSERT OR IGNORE INTO links \
-                 (source_slug, target_slug, edge_type, context, created_at, chunk_id, is_generated) \
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'), -1, 1)",
-            )
-            .bind(&normalized_slug)
-            .bind(&link.target_slug)
-            .bind(&link.edge_type)
-            .bind(&link.context)
-            .execute(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        }
-
-        Ok(())
     }
 
     pub async fn import_dir(&self, dir: &str) -> Result<Vec<String>> {
@@ -790,16 +660,6 @@ impl Engine {
 
         for entry in WalkDir::new(dir)
             .into_iter()
-            .filter_entry(|e| {
-                let name = e.file_name().to_string_lossy();
-                if e.file_type().is_dir() {
-                    !name.starts_with('.') && name != "node_modules" && name != "__pycache__"
-                        && name != "target" && name != "dist" && name != "build"
-                        && !name.ends_with(".dist-info") && !name.ends_with(".data")
-                } else {
-                    true
-                }
-            })
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
         {
@@ -807,36 +667,24 @@ impl Engine {
             let content = std::fs::read_to_string(path)?;
             let hash = MarkdownParser::content_hash(&content);
 
-            // Prefer repo-root-relative slugs so that `rbrain import raw/articles/`
-            // produces slugs like `raw/articles/foo` rather than just `foo`, which
-            // would cause put_page to scatter files into the project root.
-            // For files outside the repo (external import), fall back to
-            // import-dir-relative path and prepend `raw/` to keep them organised.
-            let repo_canon = self.inner.config.repo_dir.canonicalize()
-                .unwrap_or_else(|_| self.inner.config.repo_dir.clone());
-            let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            let slug = if let Ok(rel) = path_canon.strip_prefix(&repo_canon) {
-                rel.to_string_lossy()
-                    .trim_end_matches(".md")
-                    .trim()
-                    .replace(std::path::MAIN_SEPARATOR, "/")
-            } else {
-                let rel = path.strip_prefix(&prefix)
-                    .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-                format!("raw/{}", rel.to_string_lossy()
-                    .trim_end_matches(".md")
-                    .trim()
-                    .replace(std::path::MAIN_SEPARATOR, "/"))
-            };
+            let relative = path
+                .strip_prefix(&prefix)
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            let slug = relative
+                .to_string_lossy()
+                .trim_end_matches(".md")
+                .trim()
+                .replace(std::path::MAIN_SEPARATOR, "/");
             let normalized = MarkdownParser::normalize_slug(&slug);
 
-            let db_hash: Option<String> = sqlx::query_scalar(
-                "SELECT content_hash FROM pages WHERE slug = ?"
-            )
-            .bind(&normalized)
-            .fetch_optional(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            let db_hash: Option<String> =
+                sqlx::query_scalar("SELECT content_hash FROM pages WHERE slug = ?")
+                    .bind(&normalized)
+                    .fetch_optional(&self.inner.db)
+                    .await
+                    .map_err(|e| {
+                        BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
 
             if let Some(existing) = db_hash {
                 if existing == hash {
@@ -845,27 +693,27 @@ impl Engine {
             }
 
             let parse_result = MarkdownParser::parse(&content);
-            let page_type = parse_result.frontmatter.get("type")
+            let page_type = parse_result
+                .frontmatter
+                .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("note")
                 .to_string();
 
-            let mut page = Page::new(
-                normalized.clone(),
-                page_type,
-                parse_result.compiled_truth,
-            );
+            let mut page = Page::new(normalized.clone(), page_type, parse_result.compiled_truth);
             page.timeline = parse_result.timeline;
             page.frontmatter = parse_result.frontmatter;
             if let Some(t) = page.frontmatter.get("title").and_then(|v| v.as_str()) {
                 page.title = t.to_string();
             }
             if let Some(tags_val) = page.frontmatter.get("tags").and_then(|v| v.as_array()) {
-                page.tags = tags_val.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                page.tags = tags_val
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
             }
 
-            let full_text = format!("{} {}", page.compiled_truth, page.timeline);
-            page.language = Some(rbrain_core::page::Language::detect(&full_text));
+            page.language = Some(rbrain_core::page::Language::detect(&page.compiled_truth));
 
             self.put_page(page.clone()).await?;
             if self.has_embedder() {
@@ -879,8 +727,14 @@ impl Engine {
         Ok(imported)
     }
 
-    pub async fn keyword_search(&self, query: &str, lang: &rbrain_core::page::Language, k: usize) -> Result<Vec<(i64, f32)>> {
-        self.keyword_search_filtered(query, lang, k, None, None).await
+    pub async fn keyword_search(
+        &self,
+        query: &str,
+        lang: &rbrain_core::page::Language,
+        k: usize,
+    ) -> Result<Vec<(i64, f32)>> {
+        self.keyword_search_filtered(query, lang, k, None, None)
+            .await
     }
 
     /// Keyword search with optional page_type and tag filters applied post-Tantivy.
@@ -892,23 +746,22 @@ impl Engine {
         page_type: Option<&str>,
         tag: Option<&str>,
     ) -> Result<Vec<(i64, f32)>> {
-        let keyword_index = self
-            .inner
-            .keyword_index
-            .as_ref()
-            .ok_or_else(|| BrainError::ApiUnreachable {
-                provider: "search".to_string(),
-                message: "Keyword index not configured".to_string(),
-            })?;
+        let keyword_index =
+            self.inner
+                .keyword_index
+                .as_ref()
+                .ok_or_else(|| BrainError::ApiUnreachable {
+                    provider: "search".to_string(),
+                    message: "Keyword index not configured".to_string(),
+                })?;
 
         // Fetch extra results so filtering doesn't starve the result set
         let raw = keyword_index.search(query, lang, k * 5).await?;
-        if raw.is_empty() {
-            return Ok(vec![]);
+        if raw.is_empty() || (page_type.is_none() && tag.is_none()) {
+            return Ok(raw.into_iter().take(k).collect());
         }
 
-        // Tantivy entries can outlive DB chunks after a plain filesystem sync.
-        // Always intersect with live chunks before exposing search results.
+        // Build a filtered set of allowed chunk IDs via SQL
         let ids: Vec<i64> = raw.iter().map(|(id, _)| *id).collect();
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
@@ -921,7 +774,7 @@ impl Engine {
             conditions.push("p.page_type = ?");
         }
         if tag.is_some() {
-            conditions.push("p.tags LIKE ?");
+            conditions.push("EXISTS (SELECT 1 FROM json_each(p.tags) WHERE json_each.value = ?)");
         }
         if !conditions.is_empty() {
             sql.push_str(" AND ");
@@ -936,7 +789,7 @@ impl Engine {
             q = q.bind(pt);
         }
         if let Some(tg) = tag {
-            q = q.bind(format!("%{}%", tg));
+            q = q.bind(tg);
         }
 
         let allowed: std::collections::HashSet<i64> = q
@@ -978,7 +831,9 @@ impl Engine {
         // Also run keyword search with the type/tag filter directly, to guarantee
         // that filtered pages aren't crowded out of the global hybrid ranking by
         // many high-scoring pages of other types.
-        let filtered_kw = self.keyword_search_filtered(query, lang, k * 5, page_type, tag).await?;
+        let filtered_kw = self
+            .keyword_search_filtered(query, lang, k * 5, page_type, tag)
+            .await?;
         if !filtered_kw.is_empty() {
             let existing_ids: HashSet<i64> = ranked.iter().map(|(id, _)| *id).collect();
             for (id, score) in filtered_kw {
@@ -1004,7 +859,7 @@ impl Engine {
             conditions.push("p.page_type = ?");
         }
         if tag.is_some() {
-            conditions.push("p.tags LIKE ?");
+            conditions.push("EXISTS (SELECT 1 FROM json_each(p.tags) WHERE json_each.value = ?)");
         }
         if !conditions.is_empty() {
             sql.push_str(" AND ");
@@ -1019,7 +874,7 @@ impl Engine {
             q = q.bind(pt);
         }
         if let Some(tg) = tag {
-            q = q.bind(format!("%{}%", tg));
+            q = q.bind(tg);
         }
 
         let allowed: std::collections::HashSet<i64> = q
@@ -1033,27 +888,30 @@ impl Engine {
         let filtered: Vec<(i64, f64)> = ranked
             .into_iter()
             .filter(|(id, _)| allowed.contains(id))
-            .take(k)
             .collect();
 
         let fetch_ids: Vec<i64> = filtered.iter().map(|(id, _)| *id).collect();
         let texts = self.fetch_chunks_text(&fetch_ids).await?;
-        let text_map: HashMap<i64, (String, String, String)> = texts
+        let text_map: HashMap<i64, (String, String)> = texts
             .into_iter()
-            .map(|(id, text, slug, pt)| (id, (text, slug, pt)))
+            .map(|(id, text, slug)| (id, (text, slug)))
             .collect();
 
-        Ok(filtered
+        let chunks = filtered
             .into_iter()
             .filter_map(|(id, score)| {
-                text_map.get(&id).map(|(text, slug, pt)| ChunkResult {
+                text_map.get(&id).map(|(text, slug)| ChunkResult {
                     chunk_id: id,
                     score,
                     text: text.clone(),
                     page_slug: slug.clone(),
-                    page_type: pt.clone(),
                 })
             })
+            .collect::<Vec<_>>();
+
+        Ok(apply_page_cap(chunks.into_iter(), MAX_POOL_DEFAULT)
+            .into_iter()
+            .take(k)
             .collect())
     }
 
@@ -1092,15 +950,11 @@ impl Engine {
         let deepseek = self.inner.deepseek.as_ref().cloned();
 
         let (intent, expansions) = if let Some(client) = deepseek {
-            let intent_result = tokio::time::timeout(
-                Duration::from_secs(2),
-                client.classify_intent(query)
-            ).await;
+            let intent_result =
+                tokio::time::timeout(Duration::from_secs(2), client.classify_intent(query)).await;
 
-            let expansions_result = tokio::time::timeout(
-                Duration::from_secs(2),
-                client.expand_query(query, 3)
-            ).await;
+            let expansions_result =
+                tokio::time::timeout(Duration::from_secs(2), client.expand_query(query, 3)).await;
 
             let intent = match intent_result {
                 Ok(Ok(i)) => i,
@@ -1138,7 +992,10 @@ impl Engine {
             let variant = &all_queries[idx];
 
             let vector_results = self.vector_search(variant, k).await.unwrap_or_default();
-            let keyword_results = self.keyword_search(variant, lang, k).await.unwrap_or_default();
+            let keyword_results = self
+                .keyword_search(variant, lang, k)
+                .await
+                .unwrap_or_default();
 
             let vector_rrf: Vec<(i64, usize)> = vector_results
                 .into_iter()
@@ -1162,18 +1019,8 @@ impl Engine {
 
         let fused = rrf(all_results, 60.0);
 
-        // Entity queries: strong boost toward high-indegree pages (specific person/concept lookup).
-        // General queries: gentle boost so foundational papers cited by many synthesis pages
-        //   surface higher. Uses existing page_stats.indegree which reflects wikilink citations
-        //   from synthesis/concept pages — a reasonable proxy for academic importance.
-        // Temporal/Event: no boost (recency or specificity matters more than citation count).
-        let boost_weight = match intent {
-            Intent::Entity  => 0.15,
-            Intent::General => 0.05,
-            _               => 0.0,
-        };
-        let boosted = if boost_weight > 0.0 {
-            self.apply_backlink_boost_weighted(&fused, boost_weight).await?
+        let boosted = if matches!(intent, Intent::Entity) {
+            self.apply_backlink_boost(&fused).await?
         } else {
             fused
         };
@@ -1181,7 +1028,7 @@ impl Engine {
         Ok(boosted)
     }
 
-    async fn apply_backlink_boost_weighted(&self, results: &[(i64, f64)], weight: f64) -> Result<Vec<(i64, f64)>> {
+    async fn apply_backlink_boost(&self, results: &[(i64, f64)]) -> Result<Vec<(i64, f64)>> {
         if results.is_empty() {
             return Ok(results.to_vec());
         }
@@ -1189,7 +1036,10 @@ impl Engine {
         let chunk_ids: Vec<i64> = results.iter().map(|(id, _)| *id).collect();
         let placeholders: String = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
-        let query = format!("SELECT id, page_slug FROM chunks WHERE id IN ({})", placeholders);
+        let query = format!(
+            "SELECT id, page_slug FROM chunks WHERE id IN ({})",
+            placeholders
+        );
         let mut sql_query = sqlx::query(&query);
         for chunk_id in &chunk_ids {
             sql_query = sql_query.bind(chunk_id);
@@ -1210,8 +1060,15 @@ impl Engine {
             return Ok(results.to_vec());
         }
 
-        let slug_placeholders: String = unique_slugs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let indegree_query = format!("SELECT slug, indegree FROM page_stats WHERE slug IN ({})", slug_placeholders);
+        let slug_placeholders: String = unique_slugs
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let indegree_query = format!(
+            "SELECT slug, indegree FROM page_stats WHERE slug IN ({})",
+            slug_placeholders
+        );
 
         let mut indegree_sql = sqlx::query(&indegree_query);
         for slug in &unique_slugs {
@@ -1233,7 +1090,7 @@ impl Engine {
             .map(|&(chunk_id, score)| {
                 let slug = chunk_to_slug.get(&chunk_id);
                 let indegree = slug.and_then(|s| indegrees.get(s)).copied().unwrap_or(0) as f64;
-                let boost = 1.0 + indegree.ln_1p() * weight;
+                let boost = 1.0 + indegree.ln_1p() * 0.15;
                 (chunk_id, score * boost)
             })
             .collect();
@@ -1252,17 +1109,17 @@ impl Engine {
                 provider: "search".to_string(),
                 message: "Vector search not configured".to_string(),
             })?;
-        let vector_store = self
-            .inner
-            .vector_store
-            .as_ref()
-            .ok_or_else(|| BrainError::ApiUnreachable {
-                provider: "search".to_string(),
-                message: "Vector store not configured".to_string(),
-            })?;
+        let vector_store =
+            self.inner
+                .vector_store
+                .as_ref()
+                .ok_or_else(|| BrainError::ApiUnreachable {
+                    provider: "search".to_string(),
+                    message: "Vector store not configured".to_string(),
+                })?;
 
         let query_embedding = embedder.embed_one(query).await?;
-        let mut results = vector_store.search(&query_embedding, k).await?;
+        let results = vector_store.search(&query_embedding, k).await?;
 
         if results.is_empty() {
             return Ok(results);
@@ -1270,7 +1127,10 @@ impl Engine {
 
         let chunk_ids: Vec<i64> = results.iter().map(|(id, _)| *id).collect();
         let placeholders: String = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let query = format!("SELECT id, page_slug FROM chunks WHERE id IN ({})", placeholders);
+        let query = format!(
+            "SELECT id, page_slug FROM chunks WHERE id IN ({})",
+            placeholders
+        );
 
         let mut sql_query = sqlx::query(&query);
         for chunk_id in &chunk_ids {
@@ -1287,16 +1147,20 @@ impl Engine {
             chunk_to_slug.insert(row.get::<i64, _>("id"), row.get("page_slug"));
         }
 
-        // A saved vector index may still contain IDs invalidated by a non-embedding
-        // sync. Do not surface vectors whose backing chunks no longer exist.
-        results.retain(|(chunk_id, _)| chunk_to_slug.contains_key(chunk_id));
         let unique_slugs: Vec<String> = chunk_to_slug.values().cloned().collect();
         if unique_slugs.is_empty() {
-            return Ok(vec![]);
+            return Ok(results);
         }
 
-        let slug_placeholders: String = unique_slugs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let indegree_query = format!("SELECT slug, indegree FROM page_stats WHERE slug IN ({})", slug_placeholders);
+        let slug_placeholders: String = unique_slugs
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let indegree_query = format!(
+            "SELECT slug, indegree FROM page_stats WHERE slug IN ({})",
+            slug_placeholders
+        );
 
         let mut indegree_sql = sqlx::query(&indegree_query);
         for slug in &unique_slugs {
@@ -1319,25 +1183,23 @@ impl Engine {
                 let slug = chunk_to_slug.get(&chunk_id);
                 let indegree = slug.and_then(|s| indegrees.get(s)).copied().unwrap_or(0) as f64;
                 let boost = 1.0 + indegree.ln_1p() * 0.1;
-                (chunk_id, score / boost as f32)
+                (chunk_id, score * boost as f32)
             })
             .collect();
 
-        boosted_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        boosted_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(boosted_results)
     }
 
-    /// Fetch chunk text, page_slug, and page_type for a set of chunk IDs, preserving rank order.
-    pub async fn fetch_chunks_text(&self, ids: &[i64]) -> Result<Vec<(i64, String, String, String)>> {
+    /// Fetch chunk text and page_slug for a set of chunk IDs, preserving rank order.
+    pub async fn fetch_chunks_text(&self, ids: &[i64]) -> Result<Vec<(i64, String, String)>> {
         if ids.is_empty() {
             return Ok(vec![]);
         }
         let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let query = format!(
-            "SELECT c.id, c.text, c.page_slug, COALESCE(p.page_type, 'note') as page_type \
-             FROM chunks c LEFT JOIN pages p ON c.page_slug = p.slug \
-             WHERE c.id IN ({})",
+            "SELECT id, text, page_slug FROM chunks WHERE id IN ({})",
             placeholders
         );
         let mut sql = sqlx::query(&query);
@@ -1349,17 +1211,19 @@ impl Engine {
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        let mut map: HashMap<i64, (String, String, String)> = rows
+        let mut map: HashMap<i64, (String, String)> = rows
             .iter()
-            .map(|r| (
-                r.get::<i64, _>("id"),
-                (r.get::<String, _>("text"), r.get::<String, _>("page_slug"), r.get::<String, _>("page_type")),
-            ))
+            .map(|r| {
+                (
+                    r.get::<i64, _>("id"),
+                    (r.get::<String, _>("text"), r.get::<String, _>("page_slug")),
+                )
+            })
             .collect();
 
         Ok(ids
             .iter()
-            .filter_map(|id| map.remove(id).map(|(text, slug, pt)| (*id, text, slug, pt)))
+            .filter_map(|id| map.remove(id).map(|(text, slug)| (*id, text, slug)))
             .collect())
     }
 
@@ -1381,43 +1245,36 @@ impl Engine {
         k: usize,
         expand: bool,
     ) -> Result<Vec<ChunkResult>> {
+        let candidate_limit = k.saturating_mul(5).max(k);
         let ranked = if expand {
-            self.expanded_search(query, lang, k).await?
+            self.expanded_search(query, lang, candidate_limit).await?
         } else {
-            self.hybrid_search(query, lang, k).await?
+            self.hybrid_search(query, lang, candidate_limit).await?
         };
 
         let ids: Vec<i64> = ranked.iter().map(|(id, _)| *id).collect();
         let texts = self.fetch_chunks_text(&ids).await?;
 
-        let text_map: HashMap<i64, (String, String, String)> = texts
+        let text_map: HashMap<i64, (String, String)> = texts
             .into_iter()
-            .map(|(id, text, slug, pt)| (id, (text, slug, pt)))
+            .map(|(id, text, slug)| (id, (text, slug)))
             .collect();
 
-        // Per-page deduplication: cap at 2 chunks per source page so a single
-        // document cannot dominate the context window and crowd out other sources.
-        let mut page_chunk_count: HashMap<String, usize> = HashMap::new();
-        Ok(ranked
+        let chunks = ranked
             .into_iter()
             .filter_map(|(id, score)| {
-                text_map.get(&id).map(|(text, slug, pt)| ChunkResult {
+                text_map.get(&id).map(|(text, slug)| ChunkResult {
                     chunk_id: id,
                     score,
                     text: text.clone(),
                     page_slug: slug.clone(),
-                    page_type: pt.clone(),
                 })
             })
-            .filter(|cr| {
-                let count = page_chunk_count.entry(cr.page_slug.clone()).or_insert(0);
-                if *count < 2 {
-                    *count += 1;
-                    true
-                } else {
-                    false
-                }
-            })
+            .collect::<Vec<_>>();
+
+        Ok(apply_page_cap(chunks.into_iter(), MAX_POOL_DEFAULT)
+            .into_iter()
+            .take(k)
             .collect())
     }
 
@@ -1485,26 +1342,15 @@ impl Engine {
         context: Option<&str>,
         chunk_id: Option<i64>,
     ) -> Result<()> {
+        EdgeType::validate_label(edge_type)?;
+
         let source = MarkdownParser::normalize_slug(source_slug);
         let target = MarkdownParser::normalize_slug(target_slug);
         let cid = chunk_id.unwrap_or(-1);
 
-        // Promote an extracted edge to an explicit edge when the keys collide.
-        sqlx::query(
-            "DELETE FROM links WHERE source_slug = ?1 AND target_slug = ?2 AND edge_type = ?3 \
-             AND chunk_id = ?4 AND source_chunk_idx = -1 AND is_generated = 1",
-        )
-        .bind(&source)
-        .bind(&target)
-        .bind(edge_type)
-        .bind(cid)
-        .execute(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        // Check if a link already exists (explicit links from add_link always have source_chunk_idx = -1)
+        // Check if a link already exists
         let existing_context: Option<String> = sqlx::query_scalar(
-            "SELECT context FROM links WHERE source_slug = ?1 AND target_slug = ?2 AND edge_type = ?3 AND chunk_id = ?4 AND source_chunk_idx = -1"
+            "SELECT context FROM links WHERE source_slug = ?1 AND target_slug = ?2 AND edge_type = ?3 AND chunk_id = ?4"
         )
         .bind(&source)
         .bind(&target)
@@ -1522,9 +1368,9 @@ impl Engine {
         };
 
         sqlx::query(
-            "INSERT INTO links (source_slug, target_slug, edge_type, context, created_at, chunk_id, source_chunk_idx) \
-             VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, -1) \
-             ON CONFLICT(source_slug, target_slug, edge_type, chunk_id, source_chunk_idx) DO UPDATE SET context = ?4",
+            "INSERT INTO links (source_slug, target_slug, edge_type, context, created_at, chunk_id) \
+             VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5) \
+             ON CONFLICT(source_slug, target_slug, edge_type, chunk_id) DO UPDATE SET context = ?4",
         )
         .bind(&source)
         .bind(&target)
@@ -1592,13 +1438,16 @@ impl Engine {
         let rows = sqlx::query(
             "SELECT p.slug, COALESCE(ps.indegree, 0) as indegree \
              FROM pages p LEFT JOIN page_stats ps ON p.slug = ps.slug \
-             ORDER BY indegree DESC LIMIT ?1"
+             ORDER BY indegree DESC LIMIT ?1",
         )
         .bind(n as i64)
         .fetch_all(&self.inner.db)
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        Ok(rows.iter().map(|r| (r.get::<String, _>("slug"), r.get::<i64, _>("indegree"))).collect())
+        Ok(rows
+            .iter()
+            .map(|r| (r.get::<String, _>("slug"), r.get::<i64, _>("indegree")))
+            .collect())
     }
 
     /// Return (embedded_chunks, total_chunks) counts by page_type.
@@ -1608,16 +1457,21 @@ impl Engine {
              COUNT(c.id) as total, \
              SUM(CASE WHEN c.has_embedding = 1 THEN 1 ELSE 0 END) as embedded \
              FROM pages p LEFT JOIN chunks c ON c.page_slug = p.slug \
-             GROUP BY p.page_type ORDER BY total DESC"
+             GROUP BY p.page_type ORDER BY total DESC",
         )
         .fetch_all(&self.inner.db)
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        Ok(rows.iter().map(|r| (
-            r.get::<String, _>("page_type"),
-            r.get::<i64, _>("embedded"),
-            r.get::<i64, _>("total"),
-        )).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("page_type"),
+                    r.get::<i64, _>("embedded"),
+                    r.get::<i64, _>("total"),
+                )
+            })
+            .collect())
     }
 
     /// Prepend a dated entry to a page's timeline section.
@@ -1629,40 +1483,41 @@ impl Engine {
         text: &str,
         source: Option<&str>,
     ) -> Result<()> {
-        let (normalized, repo_path) = self.page_path(slug)?;
+        let normalized = MarkdownParser::normalize_slug(slug);
         let page = self.get_page(&normalized).await?;
-        let entry = if let Some(src) = source {
-            format!("- {}: {} [Source: {}]", date, text, src)
-        } else {
-            format!("- {}: {}", date, text)
-        };
-        let new_timeline = if page.timeline.trim().is_empty() {
-            entry
-        } else {
-            format!("{}\n{}", entry, page.timeline)
-        };
+        let mut payload = serde_json::json!({
+            "date": date,
+            "text": text,
+        });
+        if let Some(src) = source {
+            payload["source"] = serde_json::Value::String(src.to_string());
+        }
+        let entry = TimelineEntry::new(TimelineSource::User, "dated_event", payload);
+        let new_timeline = TimelineEntry::prepend_compat(&page.timeline, entry)?;
 
-        // Write file first; only update DB after filesystem succeeds.
-        let new_hash = if repo_path.exists() {
-            let canonical = MarkdownParser::to_canonical(&page.frontmatter, &page.compiled_truth, &new_timeline);
+        sqlx::query("UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2")
+            .bind(&new_timeline)
+            .bind(&normalized)
+            .execute(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        // Mirror to filesystem
+        let repo_path = self
+            .inner
+            .config
+            .repo_dir
+            .join(format!("{}.md", normalized));
+        if repo_path.exists() {
+            let canonical = MarkdownParser::to_canonical(
+                &page.frontmatter,
+                &page.compiled_truth,
+                &new_timeline,
+            );
             std::fs::write(&repo_path, &canonical)?;
-            Some(MarkdownParser::content_hash(&canonical))
-        } else {
-            None
-        };
-
-        sqlx::query(
-            "UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2"
-        )
-        .bind(&new_timeline)
-        .bind(&normalized)
-        .execute(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        if let Some(hash) = new_hash {
+            let new_hash = MarkdownParser::content_hash(&canonical);
             sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
-                .bind(&hash)
+                .bind(&new_hash)
                 .bind(&normalized)
                 .execute(&self.inner.db)
                 .await
@@ -1673,129 +1528,48 @@ impl Engine {
 
     /// Append a short interpretive take to a page's timeline section.
     /// Direct SQL UPDATE — does NOT touch the links table, preserving explicit graph links.
-    pub async fn add_take(
-        &self,
-        slug: &str,
-        content: &str,
-        kind: &str,
-    ) -> Result<()> {
-        let (normalized, repo_path) = self.page_path(slug)?;
+    pub async fn add_take(&self, slug: &str, content: &str, kind: &str) -> Result<()> {
+        let normalized = MarkdownParser::normalize_slug(slug);
         let page = self.get_page(&normalized).await?;
-        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let entry = format!("- [take/{}] {}: {}", kind, date, content);
-        let new_timeline = if page.timeline.trim().is_empty() {
-            entry
-        } else {
-            format!("{}\n{}", page.timeline, entry)
-        };
+        let entry = TimelineEntry::new(
+            TimelineSource::User,
+            "take",
+            serde_json::json!({
+                "kind": kind,
+                "text": content,
+            }),
+        );
+        let new_timeline = TimelineEntry::append_compat(&page.timeline, entry)?;
 
-        // Write file first; only update DB after filesystem succeeds.
-        let new_hash = if repo_path.exists() {
-            let canonical = MarkdownParser::to_canonical(&page.frontmatter, &page.compiled_truth, &new_timeline);
+        sqlx::query("UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2")
+            .bind(&new_timeline)
+            .bind(&normalized)
+            .execute(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        // Mirror to filesystem
+        let repo_path = self
+            .inner
+            .config
+            .repo_dir
+            .join(format!("{}.md", normalized));
+        if repo_path.exists() {
+            let canonical = MarkdownParser::to_canonical(
+                &page.frontmatter,
+                &page.compiled_truth,
+                &new_timeline,
+            );
             std::fs::write(&repo_path, &canonical)?;
-            Some(MarkdownParser::content_hash(&canonical))
-        } else {
-            None
-        };
-
-        sqlx::query(
-            "UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2"
-        )
-        .bind(&new_timeline)
-        .bind(&normalized)
-        .execute(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        if let Some(hash) = new_hash {
+            let new_hash = MarkdownParser::content_hash(&canonical);
             sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
-                .bind(&hash)
+                .bind(&new_hash)
                 .bind(&normalized)
                 .execute(&self.inner.db)
                 .await
                 .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         }
         Ok(())
-    }
-
-    /// Fetch raw/note sources cited by a specific chunk of a synthesis or wiki page.
-    /// Filters by source_chunk_id (DB id of the synthesis chunk) via JOIN on chunks table.
-    /// Returns (target_slug, display_title, link_context) tuples.
-    /// When source_chunk_id == -1 (old data), returns empty (silent degradation).
-    async fn fetch_synthesis_sources(
-        &self,
-        slug: &str,
-        source_chunk_id: i64,
-    ) -> Vec<(String, String, String)> {
-        if source_chunk_id < 0 {
-            return Vec::new();
-        }
-        let rows = sqlx::query(
-            "SELECT l.target_slug, COALESCE(NULLIF(p.title,''), l.target_slug) as title, COALESCE(l.context,'') as ctx
-             FROM links l
-             LEFT JOIN pages p ON p.slug = l.target_slug
-             JOIN chunks c ON c.page_slug = l.source_slug
-                           AND c.chunk_idx = l.source_chunk_idx
-                           AND c.id = ?2
-             WHERE l.source_slug = ?1
-               AND (l.target_slug LIKE 'raw/%' OR p.page_type = 'note')
-             ORDER BY l.target_slug"
-        )
-        .bind(slug)
-        .bind(source_chunk_id)
-        .fetch_all(&self.inner.db)
-        .await
-        .unwrap_or_default();
-
-        rows.into_iter()
-            .map(|r| {
-                let target: String = r.get("target_slug");
-                let title: String = r.get("title");
-                let ctx: String = r.get("ctx");
-                // Derive display title: if stored title equals slug, parse slug for author/article
-                let display = if title == target {
-                    let stem = target.rsplit('/').next().unwrap_or(target.as_str());
-                    if let Some(pos) = stem.rfind('_') {
-                        format!("《{}》[{}]", &stem[..pos], &stem[pos + 1..])
-                    } else {
-                        stem.to_string()
-                    }
-                } else {
-                    title
-                };
-                (target, display, ctx)
-            })
-            .collect()
-    }
-
-    /// Build a context block for a single chunk, annotating synthesis/wiki chunks with their
-    /// original sources so the LLM can attribute ideas to the correct primary authors.
-    async fn build_chunk_block(&self, c: &ChunkResult, is_cjk: bool) -> String {
-        let header = if is_cjk {
-            format!("[来源: {} | chunk:{} | 类型: {}]", c.page_slug, c.chunk_id, c.page_type)
-        } else {
-            format!("[source: {} | chunk:{} | type: {}]", c.page_slug, c.chunk_id, c.page_type)
-        };
-
-        let mut block = format!("{}\n{}", header, c.text);
-
-        if matches!(c.page_type.as_str(), "synthesis" | "wiki") {
-            let sources = self.fetch_synthesis_sources(&c.page_slug, c.chunk_id).await;
-            if !sources.is_empty() {
-                let label = if is_cjk { "[本段所引原始文献]" } else { "[Original sources for this synthesis]" };
-                block.push_str(&format!("\n\n{}", label));
-                for (slug, display, ctx) in &sources {
-                    block.push_str(&format!("\n- {} → {}", display, slug));
-                    if !ctx.is_empty() {
-                        let preview: String = ctx.chars().take(80).collect();
-                        let lead = if is_cjk { "  论点：" } else { "  claim: " };
-                        block.push_str(&format!("\n{}{}", lead, preview));
-                    }
-                }
-            }
-        }
-
-        block
     }
 
     /// Deep-reasoning synthesis: search context, then prompt LLM to reason through
@@ -1808,35 +1582,42 @@ impl Engine {
         limit: usize,
         expand: bool,
     ) -> Result<String> {
-        let deepseek = self.inner.deepseek.as_ref().ok_or_else(|| {
-            BrainError::ApiUnreachable {
+        let deepseek = self
+            .inner
+            .deepseek
+            .as_ref()
+            .ok_or_else(|| BrainError::ApiUnreachable {
                 provider: "deepseek".to_string(),
                 message: "deepseek.api_key not configured".to_string(),
-            }
-        })?;
+            })?;
 
-        let candidates = limit.saturating_mul(5).max(limit);
-        let chunks: Vec<ChunkResult> = self.search_with_context(topic, lang, candidates, expand).await?
-            .into_iter()
-            .filter(|c| !is_derived_research_context(&c.page_type))
-            .take(limit)
-            .collect();
+        let chunks = self.search_with_context(topic, lang, limit, expand).await?;
         if chunks.is_empty() {
             return Ok(format!("No relevant content found in brain for: {}", topic));
         }
 
-        let is_cjk = matches!(lang,
+        let is_cjk = matches!(
+            lang,
             rbrain_core::page::Language::ZhHans
-            | rbrain_core::page::Language::ZhHant
-            | rbrain_core::page::Language::Ja
-            | rbrain_core::page::Language::Ko
+                | rbrain_core::page::Language::ZhHant
+                | rbrain_core::page::Language::Ja
+                | rbrain_core::page::Language::Ko
         );
 
-        let mut context_parts = Vec::new();
-        for c in &chunks {
-            context_parts.push(self.build_chunk_block(c, is_cjk).await);
-        }
-        let context = context_parts.join("\n\n---\n\n");
+        let context = chunks
+            .iter()
+            .map(|c| {
+                if is_cjk {
+                    format!("[来源: {} | chunk:{}]\n{}", c.page_slug, c.chunk_id, c.text)
+                } else {
+                    format!(
+                        "[source: {} | chunk:{}]\n{}",
+                        c.page_slug, c.chunk_id, c.text
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
 
         let (system, user) = if is_cjk {
             let sys = "你是一位严谨的学术研究者。根据提供的原始材料，对给定问题进行深入推理：\
@@ -1844,14 +1625,8 @@ impl Engine {
                 2. 指出材料间的张力、矛盾或空白\
                 3. 形成有依据的工作判断（注明不确定之处）\
                 4. 列出尚待回答的开放性问题\
-                5. 用Markdown格式，包含：## 核心观点 / ## 张力与矛盾 / ## 工作判断 / ## 开放问题\n\
-                引用规则：\
-                - 引用材料时用 [[slug | chunk:N]] 格式，slug 和 chunk 编号来自材料头部标注，每个核心论断至少注明一处。\
-                - 若材料标注「类型: synthesis」或「类型: wiki」，这是对原始文献的综合，非一手来源。\
-                  其「本段所引原始文献」块列出了原始作者和论文，请将论点归因于该块中列出的原始作者\
-                  （格式：某作者（年份）认为……[[raw/articles/原文slug | chunk:N]]），\
-                  引用该原始文献的 slug，而非引用综述页面。综述仅作为发现线索，学术归因须落到原始来源。\
-                - 标注「类型: note」的材料或 raw/ 开头的 slug 可直接引用。";
+                5. 用Markdown格式，包含：## 核心观点 / ## 张力与矛盾 / ## 工作判断 / ## 开放问题\
+                引用材料时注明来源slug。";
             let usr = format!("研究问题：{}\n\n材料：\n\n{}", topic, context);
             (sys, usr)
         } else {
@@ -1861,21 +1636,533 @@ impl Engine {
                 2. Note tensions, contradictions, or gaps between sources\
                 3. Form a working judgment (flagging uncertainty where it exists)\
                 4. List open questions that remain unanswered\
-                Use Markdown with sections: ## Core Claims / ## Tensions & Gaps / ## Working Judgment / ## Open Questions\n\
-                Citation rules:\
-                - Cite sources using [[slug | chunk:N]] format (slug and chunk number from the source header). Each key claim must cite at least one source.\
-                - If a source is marked \"type: synthesis\" or \"type: wiki\", it is a secondary source summarising primary literature. \
-                  Its \"[Original sources]\" block lists the original authors and articles. \
-                  Attribute ideas to the authors listed in that block \
-                  (format: Author (year) argues... [[raw/articles/slug | chunk:N]]) \
-                  and cite the original source slugs, not the synthesis page. \
-                  The synthesis is a finding aid, not a citable primary source.\
-                - Sources marked \"type: note\" or raw/ slugs can be cited directly.";
+                Use Markdown with sections: ## Core Claims / ## Tensions & Gaps / ## Working Judgment / ## Open Questions\
+                Cite sources by slug when referencing material.";
             let usr = format!("Research question: {}\n\nSources:\n\n{}", topic, context);
             (sys, usr)
         };
 
         deepseek.chat(system, &user).await
+    }
+
+    pub async fn create_research_run(
+        &self,
+        run_id: &str,
+        title: &str,
+        question: Option<&str>,
+    ) -> Result<Page> {
+        let run_id = run_id.trim();
+        if run_id.is_empty() {
+            return Err(BrainError::Conflict("run_id cannot be empty".to_string()));
+        }
+
+        let slug = format!("research/runs/{}", run_id);
+        let mut content = format!("# {}\n\n", title.trim());
+        if let Some(question) = question.filter(|q| !q.trim().is_empty()) {
+            content.push_str("## Research Question\n\n");
+            content.push_str(question.trim());
+            content.push('\n');
+        }
+
+        let mut page = Page::new(slug, "research_run".to_string(), content);
+        page.title = title.trim().to_string();
+        page.frontmatter = serde_json::json!({
+            "type": "research_run",
+            "run_id": run_id,
+            "status": "active",
+            "title": page.title,
+            "question": question.unwrap_or("")
+        });
+
+        self.put_page(page.clone()).await?;
+        Ok(page)
+    }
+
+    pub async fn register_input(
+        &self,
+        run_slug: &str,
+        input_slug: &str,
+        title: &str,
+        input_type: &str,
+        content: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<Page> {
+        let page_type = PageType::from_str(input_type).unwrap();
+        let allowed = matches!(
+            page_type,
+            PageType::Dataset
+                | PageType::LiteratureCorpus
+                | PageType::CitationRecord
+                | PageType::Source
+                | PageType::MethodNote
+                | PageType::ResearchMemo
+        );
+        if !allowed {
+            return Err(BrainError::Conflict(format!(
+                "unsupported research input type '{}'",
+                input_type
+            )));
+        }
+
+        let mut frontmatter = metadata.unwrap_or_else(|| serde_json::json!({}));
+        if !frontmatter.is_object() {
+            return Err(BrainError::Conflict(
+                "input metadata must be a JSON object".to_string(),
+            ));
+        }
+        let obj = frontmatter.as_object_mut().unwrap();
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String(page_type.as_str().to_string()),
+        );
+        obj.insert(
+            "title".to_string(),
+            serde_json::Value::String(title.trim().to_string()),
+        );
+        if matches!(page_type, PageType::Dataset) && !obj.contains_key("source") {
+            obj.insert(
+                "source".to_string(),
+                serde_json::Value::String("manual".to_string()),
+            );
+        }
+
+        let mut page = Page::new(
+            input_slug.to_string(),
+            page_type.as_str().to_string(),
+            content.to_string(),
+        );
+        page.title = title.trim().to_string();
+        page.frontmatter = frontmatter;
+
+        self.put_page(page.clone()).await?;
+
+        let edge_type = match page_type {
+            PageType::Dataset => EdgeType::UsesDataset.as_str(),
+            PageType::LiteratureCorpus => EdgeType::UsesCorpus.as_str(),
+            PageType::CitationRecord => EdgeType::Cites.as_str(),
+            PageType::MethodNote => EdgeType::UsesMethod.as_str(),
+            PageType::Source | PageType::ResearchMemo => EdgeType::References.as_str(),
+            _ => EdgeType::References.as_str(),
+        };
+        self.add_link(
+            run_slug,
+            &page.slug,
+            edge_type,
+            Some("research run registered input"),
+            None,
+        )
+        .await?;
+
+        Ok(page)
+    }
+
+    pub async fn record_artifact(
+        &self,
+        run_slug: &str,
+        artifact_slug: &str,
+        title: &str,
+        artifact_kind: &str,
+        path: &str,
+        description: &str,
+    ) -> Result<Page> {
+        let mut page = Page::new(
+            artifact_slug.to_string(),
+            "artifact".to_string(),
+            description.to_string(),
+        );
+        page.title = title.trim().to_string();
+        page.frontmatter = serde_json::json!({
+            "type": "artifact",
+            "artifact_kind": artifact_kind,
+            "path": path,
+            "title": page.title
+        });
+
+        self.put_page(page.clone()).await?;
+        self.add_link(
+            run_slug,
+            &page.slug,
+            EdgeType::Produces.as_str(),
+            Some("research run produced artifact"),
+            None,
+        )
+        .await?;
+        Ok(page)
+    }
+
+    pub async fn record_finding(
+        &self,
+        run_slug: &str,
+        finding_slug: &str,
+        title: &str,
+        status: &str,
+        content: &str,
+        supporting_slugs: &[String],
+    ) -> Result<Page> {
+        let mut page = Page::new(
+            finding_slug.to_string(),
+            "finding".to_string(),
+            content.to_string(),
+        );
+        page.title = title.trim().to_string();
+        page.frontmatter = serde_json::json!({
+            "type": "finding",
+            "status": status,
+            "title": page.title
+        });
+
+        self.put_page(page.clone()).await?;
+        self.add_link(
+            run_slug,
+            &page.slug,
+            EdgeType::Produces.as_str(),
+            Some("research run produced finding"),
+            None,
+        )
+        .await?;
+
+        for support in supporting_slugs {
+            self.add_link(
+                &page.slug,
+                support,
+                EdgeType::Supports.as_str(),
+                Some("finding support evidence"),
+                None,
+            )
+            .await?;
+        }
+
+        Ok(page)
+    }
+
+    pub async fn record_validation_report(
+        &self,
+        run_slug: &str,
+        report_slug: &str,
+        title: &str,
+        validator: &str,
+        status: &str,
+        content: &str,
+        validates_slugs: &[String],
+        suggested_actions: Option<serde_json::Value>,
+    ) -> Result<Page> {
+        let mut page = Page::new(
+            report_slug.to_string(),
+            "validation_report".to_string(),
+            content.to_string(),
+        );
+        page.title = title.trim().to_string();
+        let mut frontmatter = serde_json::json!({
+            "type": "validation_report",
+            "validator": validator,
+            "status": status,
+            "title": page.title
+        });
+        if let Some(actions) = suggested_actions {
+            frontmatter["suggested_actions"] = actions;
+        }
+        page.frontmatter = frontmatter;
+
+        self.put_page(page.clone()).await?;
+        self.add_link(
+            run_slug,
+            &page.slug,
+            EdgeType::Produces.as_str(),
+            Some("research run produced validation report"),
+            None,
+        )
+        .await?;
+
+        for target in validates_slugs {
+            self.add_link(
+                &page.slug,
+                target,
+                EdgeType::Validates.as_str(),
+                Some("validation report validates target"),
+                None,
+            )
+            .await?;
+        }
+
+        Ok(page)
+    }
+
+    pub async fn record_action_item(
+        &self,
+        run_slug: &str,
+        action_slug: &str,
+        title: &str,
+        action_kind: &str,
+        status: &str,
+        content: &str,
+        target_slugs: &[String],
+    ) -> Result<Page> {
+        let mut page = Page::new(
+            action_slug.to_string(),
+            "action_item".to_string(),
+            content.to_string(),
+        );
+        page.title = title.trim().to_string();
+        page.frontmatter = serde_json::json!({
+            "type": "action_item",
+            "action_kind": action_kind,
+            "status": status,
+            "title": page.title
+        });
+
+        self.put_page(page.clone()).await?;
+        self.add_link(
+            run_slug,
+            &page.slug,
+            EdgeType::Produces.as_str(),
+            Some("research run produced action item"),
+            None,
+        )
+        .await?;
+
+        for target in target_slugs {
+            self.add_link(
+                &page.slug,
+                target,
+                EdgeType::Recommends.as_str(),
+                Some("action item recommends target follow-up"),
+                None,
+            )
+            .await?;
+        }
+
+        Ok(page)
+    }
+
+    pub async fn get_research_protocol(&self, run_slug: &str) -> Result<ResearchProtocol> {
+        let run = self.get_page(run_slug).await?;
+        if run.page_type != PageType::ResearchRun.as_str() {
+            return Err(BrainError::Conflict(format!(
+                "page '{}' is not a research_run",
+                run.slug
+            )));
+        }
+
+        let links = self.outlinks(&run.slug).await?;
+        let mut inputs = Vec::new();
+        let mut artifacts = Vec::new();
+        let mut findings = Vec::new();
+        let mut validation_reports = Vec::new();
+        let mut action_items = Vec::new();
+        let mut related = Vec::new();
+        let mut relation_edges = Vec::new();
+
+        for link in links {
+            let target = match self.get_page(&link.target_slug).await {
+                Ok(page) => page,
+                Err(_) => continue,
+            };
+            let summary = ResearchProtocolPage::from_page(&target);
+            relation_edges.push(ResearchProtocolEdge::from_link(&run.slug, &link));
+
+            match link.edge_type.as_str() {
+                "uses_dataset" | "uses_corpus" | "uses_method" | "cites" | "references" => {
+                    inputs.push(summary)
+                }
+                "produces" => match target.page_type.as_str() {
+                    "artifact" => artifacts.push(summary),
+                    "finding" => findings.push(summary),
+                    "validation_report" => validation_reports.push(summary),
+                    "action_item" => action_items.push(summary),
+                    _ => related.push(summary),
+                },
+                _ => related.push(summary),
+            }
+        }
+
+        for page in validation_reports.iter().chain(action_items.iter()) {
+            for link in self.outlinks(&page.slug).await? {
+                if matches!(link.edge_type.as_str(), "validates" | "recommends") {
+                    relation_edges.push(ResearchProtocolEdge::from_link(&page.slug, &link));
+                }
+            }
+        }
+
+        Ok(ResearchProtocol {
+            run: ResearchProtocolPage::from_page(&run),
+            inputs,
+            artifacts,
+            findings,
+            validation_reports,
+            action_items,
+            related,
+            edges: relation_edges,
+        })
+    }
+
+    pub async fn validate_research_run(&self, run_slug: &str) -> Result<Vec<ValidatorResult>> {
+        let run = self.get_page(run_slug).await?;
+        if run.page_type != PageType::ResearchRun.as_str() {
+            return Err(BrainError::Conflict(format!(
+                "page '{}' is not a research_run",
+                run.slug
+            )));
+        }
+
+        let validators = vec![
+            research_run_has_input(&self.inner.db, &run.slug).await?,
+            produced_artifact_exists(&self.inner.db, &run.slug).await?,
+            artifact_hash_present(&self.inner.db, &run.slug).await?,
+            finding_has_supporting_evidence(&self.inner.db, &run.slug).await?,
+        ];
+
+        for result in &validators {
+            self.persist_validator_result(&run.slug, result).await?;
+        }
+
+        Ok(validators)
+    }
+
+    async fn persist_validator_result(
+        &self,
+        run_slug: &str,
+        result: &ValidatorResult,
+    ) -> Result<()> {
+        let validator_slug = sanitize_slug_part(&result.validator);
+        let report_slug = format!("{}/validation/{}", run_slug, validator_slug);
+        let affected = if result.affected_slugs.is_empty() {
+            vec![run_slug.to_string()]
+        } else {
+            result.affected_slugs.clone()
+        };
+        let suggested_actions = serde_json::to_value(&result.suggested_actions)?;
+        let content = render_validator_result(result)?;
+
+        self.record_validation_report(
+            run_slug,
+            &report_slug,
+            &format!("{} validation", result.validator),
+            &result.validator,
+            result.status.as_str(),
+            &content,
+            &affected,
+            Some(suggested_actions),
+        )
+        .await?;
+
+        for (idx, action) in result.suggested_actions.iter().enumerate() {
+            let action_slug = format!(
+                "{}/actions/{}-{}",
+                run_slug,
+                validator_slug,
+                idx.saturating_add(1)
+            );
+            let targets = {
+                let direct = action.target_slugs();
+                if direct.is_empty() {
+                    affected.clone()
+                } else {
+                    direct
+                }
+            };
+            let action_json = serde_json::to_string_pretty(action)?;
+            self.record_action_item(
+                run_slug,
+                &action_slug,
+                &format!("{}: {}", result.validator, action.action_kind()),
+                action.action_kind(),
+                "open",
+                &action_json,
+                &targets,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn provenance_of(&self, slug: &str, depth: usize) -> Result<ProvenanceGraph> {
+        let root = MarkdownParser::normalize_slug(slug);
+        let max_depth = depth.clamp(1, 5);
+        let provenance_edges = [
+            EdgeType::UsesDataset.as_str(),
+            EdgeType::UsesCorpus.as_str(),
+            EdgeType::UsesMethod.as_str(),
+            EdgeType::ComputedBy.as_str(),
+            EdgeType::Produces.as_str(),
+            EdgeType::Supports.as_str(),
+            EdgeType::Contradicts.as_str(),
+            EdgeType::Validates.as_str(),
+            EdgeType::Limits.as_str(),
+            EdgeType::DerivedFrom.as_str(),
+            EdgeType::Cites.as_str(),
+            EdgeType::Recommends.as_str(),
+            EdgeType::References.as_str(),
+        ];
+
+        let mut seen_nodes = HashSet::new();
+        let mut frontier = vec![root.clone()];
+        let mut edges = Vec::new();
+        let mut seen_edges = HashSet::new();
+        seen_nodes.insert(root.clone());
+
+        for _ in 0..max_depth {
+            let mut next = Vec::new();
+            for current in frontier {
+                let rows = sqlx::query(
+                    "SELECT source_slug, target_slug, edge_type, context \
+                     FROM links WHERE source_slug = ?1 OR target_slug = ?1",
+                )
+                .bind(&current)
+                .fetch_all(&self.inner.db)
+                .await
+                .map_err(|e| {
+                    BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                })?;
+
+                for row in rows {
+                    let edge_type: String = row.get("edge_type");
+                    if !provenance_edges.contains(&edge_type.as_str()) {
+                        continue;
+                    }
+
+                    let source_slug: String = row.get("source_slug");
+                    let target_slug: String = row.get("target_slug");
+                    let key = format!("{}\0{}\0{}", source_slug, target_slug, edge_type);
+                    if seen_edges.insert(key) {
+                        edges.push(ProvenanceEdge {
+                            source_slug: source_slug.clone(),
+                            target_slug: target_slug.clone(),
+                            edge_type,
+                            context: row.get("context"),
+                        });
+                    }
+
+                    for node in [source_slug, target_slug] {
+                        if seen_nodes.insert(node.clone()) {
+                            next.push(node);
+                        }
+                    }
+                }
+            }
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+
+        let mut nodes = Vec::new();
+        for node_slug in &seen_nodes {
+            if let Ok(page) = self.get_page(node_slug).await {
+                nodes.push(ProvenanceNode {
+                    slug: page.slug,
+                    page_type: page.page_type,
+                    title: page.title,
+                });
+            }
+        }
+        nodes.sort_by(|a, b| a.slug.cmp(&b.slug));
+
+        Ok(ProvenanceGraph {
+            root_slug: root,
+            nodes,
+            edges,
+        })
     }
 
     pub async fn graph_query(
@@ -1958,14 +2245,19 @@ impl Engine {
         }
 
         // Enrich depth-1 edges with context from the links table
-        let depth1_targets: Vec<String> = edges.iter()
+        let depth1_targets: Vec<String> = edges
+            .iter()
             .filter(|e| e.depth == 1)
             .map(|e| e.target.clone())
             .collect();
 
         if !depth1_targets.is_empty() {
             // Use all-? style (no ?N mixing) to avoid sqlx binding confusion
-            let ph = depth1_targets.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let ph = depth1_targets
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
             let ctx_sql = format!(
                 "SELECT target_slug, edge_type, context FROM links WHERE source_slug = ? AND target_slug IN ({})",
                 ph
@@ -1990,7 +2282,9 @@ impl Engine {
             }
             for edge in edges.iter_mut() {
                 if edge.depth == 1 {
-                    edge.context = ctx_map.get(&(edge.target.clone(), edge.edge_type.clone())).cloned();
+                    edge.context = ctx_map
+                        .get(&(edge.target.clone(), edge.edge_type.clone()))
+                        .cloned();
                 }
             }
         }
@@ -2016,14 +2310,17 @@ impl Engine {
         }
 
         let stale_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM chunks WHERE has_embedding = 0 OR indexed_in_vectors = 0"
+            "SELECT COUNT(*) FROM chunks WHERE has_embedding = 0 OR indexed_in_vectors = 0",
         )
         .fetch_one(&self.inner.db)
         .await
         .unwrap_or(0);
 
         if stale_count > 0 {
-            issues.push(format!("{} stale chunks need embedding/indexing", stale_count));
+            issues.push(format!(
+                "{} stale chunks need embedding/indexing",
+                stale_count
+            ));
         }
 
         let repo_dir = &self.inner.config.repo_dir;
@@ -2046,12 +2343,10 @@ impl Engine {
 
     /// Get statistics about the knowledge base
     pub async fn get_stats(&self) -> Result<BrainStats> {
-        let rows = sqlx::query(
-            "SELECT page_type, COUNT(*) as cnt FROM pages GROUP BY page_type"
-        )
-        .fetch_all(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let rows = sqlx::query("SELECT page_type, COUNT(*) as cnt FROM pages GROUP BY page_type")
+            .fetch_all(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let mut pages_by_type: HashMap<String, i64> = HashMap::new();
         for row in rows {
@@ -2060,12 +2355,11 @@ impl Engine {
             pages_by_type.insert(page_type, count);
         }
 
-        let lang_rows = sqlx::query(
-            "SELECT language, COUNT(*) as cnt FROM pages GROUP BY language"
-        )
-        .fetch_all(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let lang_rows =
+            sqlx::query("SELECT language, COUNT(*) as cnt FROM pages GROUP BY language")
+                .fetch_all(&self.inner.db)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let mut pages_by_language: HashMap<String, i64> = HashMap::new();
         for row in lang_rows {
@@ -2079,10 +2373,11 @@ impl Engine {
             .await
             .unwrap_or(0);
 
-        let with_embedding: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE has_embedding = 1")
-            .fetch_one(&self.inner.db)
-            .await
-            .unwrap_or(0);
+        let with_embedding: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE has_embedding = 1")
+                .fetch_one(&self.inner.db)
+                .await
+                .unwrap_or(0);
 
         let embedding_coverage = if total_chunks > 0 {
             (with_embedding as f64 / total_chunks as f64) * 100.0
@@ -2107,7 +2402,7 @@ impl Engine {
         };
 
         let recent_activity: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pages WHERE updated_at > datetime('now', '-7 days')"
+            "SELECT COUNT(*) FROM pages WHERE updated_at > datetime('now', '-7 days')",
         )
         .fetch_one(&self.inner.db)
         .await
@@ -2179,20 +2474,17 @@ impl Engine {
         limit: usize,
         expand: bool,
     ) -> Result<String> {
-        let deepseek = self.inner.deepseek.as_ref().ok_or_else(|| {
-            BrainError::ApiUnreachable {
+        let deepseek = self
+            .inner
+            .deepseek
+            .as_ref()
+            .ok_or_else(|| BrainError::ApiUnreachable {
                 provider: "deepseek".to_string(),
                 message: "DeepSeek not configured — set deepseek.api_key in ~/.rbrain/config.toml"
                     .to_string(),
-            }
-        })?;
+            })?;
 
-        let candidates = limit.saturating_mul(5).max(limit);
-        let chunks: Vec<ChunkResult> = self.search_with_context(topic, lang, candidates, expand).await?
-            .into_iter()
-            .filter(|c| !is_derived_research_context(&c.page_type))
-            .take(limit)
-            .collect();
+        let chunks = self.search_with_context(topic, lang, limit, expand).await?;
 
         if chunks.is_empty() {
             return Err(BrainError::ApiUnreachable {
@@ -2201,26 +2493,16 @@ impl Engine {
             });
         }
 
-        let mut context_parts = Vec::new();
-        for c in &chunks {
-            context_parts.push(self.build_chunk_block(c, true).await);
-        }
-        let context = context_parts.join("\n\n---\n\n");
+        let context = chunks
+            .iter()
+            .map(|c| format!("[来源: {}]\n{}", c.page_slug, c.text))
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
 
         let system = "你是知识库编辑。根据提供的原文材料，生成一篇简洁的Markdown wiki页面。\
             要求：包含一级标题、2-4个核心观点（用##小节）、简短结语。\
-            严格基于原文，不添加原文没有的内容。输出简体中文。\
-            引用原文时，用 [[slug | chunk:N]] 格式标注来源（slug 和 chunk 编号均来自原文材料头部的标注）。每个核心观点至少标注一处来源。\
-            注意：\
-            - 若材料标注「类型: synthesis」或「类型: wiki」，表示这是对原始文献的综合，\
-              其「本段所引原始文献」块列出了原始作者和论文。\
-              请将论点归因于该块中列出的原始作者\
-              （格式：某作者（年份）认为……[[raw/articles/原文slug | chunk:N]]），\
-              引用该原始文献的 slug，而非仅引用综述页面。综述页面仅作为发现线索，学术归因应落到原始来源。\
-            - 若材料标注「类型: note」或来自 raw/ 路径，直接引用即可。";
-        let user = format!(
-            "主题：【{topic}】\n\n原文材料：\n\n{context}\n\n请生成wiki页面。"
-        );
+            严格基于原文，不添加原文没有的内容。输出简体中文。";
+        let user = format!("主题：【{topic}】\n\n原文材料：\n\n{context}\n\n请生成wiki页面。");
 
         deepseek.chat(system, &user).await
     }
@@ -2230,7 +2512,29 @@ impl Engine {
         let mut page = self.get_page(slug).await?;
         if !page.tags.contains(&tag.to_string()) {
             page.tags.push(tag.to_string());
-            self.write_tags_to_file_and_db(&page).await?;
+            let tags_json = serde_json::to_string(&page.tags)?;
+            sqlx::query("UPDATE pages SET tags = ?1, updated_at = datetime('now') WHERE slug = ?2")
+                .bind(&tags_json)
+                .bind(&page.slug)
+                .execute(&self.inner.db)
+                .await
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+            let repo_path = self.inner.config.repo_dir.join(format!("{}.md", page.slug));
+            if repo_path.exists() {
+                let content = std::fs::read_to_string(&repo_path)?;
+                let updated = update_frontmatter_tags(&content, &page.tags);
+                std::fs::write(&repo_path, updated)?;
+                let new_hash = MarkdownParser::content_hash(&std::fs::read_to_string(&repo_path)?);
+                sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
+                    .bind(&new_hash)
+                    .bind(&page.slug)
+                    .execute(&self.inner.db)
+                    .await
+                    .map_err(|e| {
+                        BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
+            }
         }
         Ok(())
     }
@@ -2241,57 +2545,29 @@ impl Engine {
         let before = page.tags.len();
         page.tags.retain(|t| t != tag);
         if page.tags.len() != before {
-            self.write_tags_to_file_and_db(&page).await?;
-        }
-        Ok(())
-    }
-
-    async fn write_tags_to_file_and_db(&self, page: &Page) -> Result<()> {
-        let tags_json = serde_json::to_string(&page.tags)?;
-        let mut frontmatter = match &page.frontmatter {
-            serde_json::Value::Object(map) => map.clone(),
-            _ => serde_json::Map::new(),
-        };
-        frontmatter.insert(
-            "tags".to_string(),
-            serde_json::Value::Array(
-                page.tags
-                    .iter()
-                    .map(|tag| serde_json::Value::String(tag.clone()))
-                    .collect(),
-            ),
-        );
-        let frontmatter_json =
-            serde_json::to_string(&serde_json::Value::Object(frontmatter))?;
-        // Write file first; only update DB after filesystem succeeds.
-        let (_, repo_path) = self.page_path(&page.slug)?;
-        let new_hash = if repo_path.exists() {
-            let content = std::fs::read_to_string(&repo_path)?;
-            let updated = update_frontmatter_tags(&content, &page.tags);
-            let hash = MarkdownParser::content_hash(&updated);
-            std::fs::write(&repo_path, updated)?;
-            Some(hash)
-        } else {
-            None
-        };
-
-        sqlx::query(
-            "UPDATE pages SET tags = ?1, frontmatter = ?2, updated_at = datetime('now') WHERE slug = ?3",
-        )
-            .bind(&tags_json)
-            .bind(&frontmatter_json)
-            .bind(&page.slug)
-            .execute(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        if let Some(hash) = new_hash {
-            sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
-                .bind(&hash)
+            let tags_json = serde_json::to_string(&page.tags)?;
+            sqlx::query("UPDATE pages SET tags = ?1, updated_at = datetime('now') WHERE slug = ?2")
+                .bind(&tags_json)
                 .bind(&page.slug)
                 .execute(&self.inner.db)
                 .await
                 .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+            let repo_path = self.inner.config.repo_dir.join(format!("{}.md", page.slug));
+            if repo_path.exists() {
+                let content = std::fs::read_to_string(&repo_path)?;
+                let updated = update_frontmatter_tags(&content, &page.tags);
+                std::fs::write(&repo_path, updated)?;
+                let new_hash = MarkdownParser::content_hash(&std::fs::read_to_string(&repo_path)?);
+                sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
+                    .bind(&new_hash)
+                    .bind(&page.slug)
+                    .execute(&self.inner.db)
+                    .await
+                    .map_err(|e| {
+                        BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
+            }
         }
         Ok(())
     }
@@ -2327,7 +2603,11 @@ impl Engine {
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         for row in rows {
-            warnings.push(("WARN".into(), row.get::<String, _>("slug"), "missing title".into()));
+            warnings.push((
+                "WARN".into(),
+                row.get::<String, _>("slug"),
+                "missing title".into(),
+            ));
         }
 
         // Pages with no embedded chunks
@@ -2338,7 +2618,11 @@ impl Engine {
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         for slug in unembedded {
-            warnings.push(("WARN".into(), slug, "not embedded (run: rbrain embed --stale)".into()));
+            warnings.push((
+                "WARN".into(),
+                slug,
+                "not embedded (run: rbrain embed --stale)".into(),
+            ));
         }
 
         // Orphan pages (no incoming links) — skip for small brains (<= 5 pages)
@@ -2349,14 +2633,18 @@ impl Engine {
         if total > 5 {
             let orphans = self.orphan_pages().await?;
             for slug in orphans {
-                warnings.push(("INFO".into(), slug, "orphan page — no incoming links".into()));
+                warnings.push((
+                    "INFO".into(),
+                    slug,
+                    "orphan page — no incoming links".into(),
+                ));
             }
         }
 
         // Broken links (target page does not exist)
         let broken: Vec<(String, String)> = sqlx::query_as(
             "SELECT source_slug, target_slug FROM links \
-             WHERE target_slug NOT IN (SELECT slug FROM pages)"
+             WHERE target_slug NOT IN (SELECT slug FROM pages)",
         )
         .fetch_all(&self.inner.db)
         .await
@@ -2424,7 +2712,7 @@ impl Engine {
         let run_embed = stage.is_none() || stage == Some("embed");
         let run_extract = stage.is_none() || stage == Some("extract");
         let run_synthesize = stage.is_none() || stage == Some("synthesize");
-        
+
         if run_lint {
             self.dream_lint().await?;
         }
@@ -2439,26 +2727,6 @@ impl Engine {
         }
         println!("\n=== Dream Cycle Finished ===");
         Ok(())
-    }
-
-    /// Find the DB chunk_id of the chunk in `page_slug` whose text contains `context`.
-    /// Returns None if context is empty, chunks don't exist yet, or no match found.
-    async fn find_chunk_id_for_context(&self, page_slug: &str, context: &str) -> Option<i64> {
-        if context.trim().is_empty() {
-            return None;
-        }
-        let needle: String = context.chars().take(30).collect();
-        let rows = sqlx::query("SELECT id, text FROM chunks WHERE page_slug = ?1")
-            .bind(page_slug)
-            .fetch_all(&self.inner.db)
-            .await
-            .ok()?;
-        rows.into_iter()
-            .find(|r| {
-                let text: String = r.get("text");
-                text.contains(&needle)
-            })
-            .map(|r| r.get::<i64, _>("id"))
     }
 
     async fn dream_lint(&self) -> Result<()> {
@@ -2480,7 +2748,7 @@ impl Engine {
             println!("  No embedder configured, skipping embedding phase.");
             return Ok(());
         }
-        
+
         let pages = self.list_stale_pages().await?;
         if pages.is_empty() {
             println!("  All pages are up-to-date.");
@@ -2498,91 +2766,105 @@ impl Engine {
 
     async fn dream_extract(&self) -> Result<()> {
         println!("\n[Dream Cycle] Phase 3: Extracting concepts, figures, and timeline events...");
-        
+
         let query = "
             SELECT p.slug, p.page_type, p.title, p.compiled_truth, p.timeline, p.updated_at 
             FROM pages p 
             LEFT JOIN dream_metadata d ON p.slug = d.slug 
             WHERE (d.last_extracted_at IS NULL OR p.updated_at > d.last_extracted_at) 
-              AND p.page_type = 'note'
+              AND p.page_type NOT IN ('concept', 'figure') 
+              AND p.slug NOT LIKE 'synthesis/%'
         ";
-        
+
         let rows = sqlx::query(query)
             .fetch_all(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-            
+
         if rows.is_empty() {
             println!("  No pages require extraction.");
             return Ok(());
         }
-        
+
         let deepseek = self.inner.deepseek.as_ref();
-        
+
         for row in rows {
             let slug: String = row.get("slug");
             let page_type: String = row.get("page_type");
             let title: String = row.get("title");
             let compiled_truth: String = row.get("compiled_truth");
             let timeline: String = row.get("timeline");
-            
+
             println!("  Extracting from page: {}", slug);
-            
+
             let knowledge = if let Some(client) = deepseek {
-                let system = "You are a knowledge extractor. Extract key concepts, scholars/figures (people), and timeline events from the provided academic text.\n\
-                              Rules:\n\
-                              - For figures: describe the person by their REAL-WORLD identity (institution, role, field of expertise). NEVER use vague references like '本文作者', 'the author', 'this article's author', '该文作者'. If you can identify them from the text (e.g. affiliation in the abstract), state it; otherwise write their field only (e.g. '教育学研究者，专注高等教育学自主知识体系').\n\
-                              - For concepts: describe based on how the text defines or uses it; include the source article slug for attribution.\n\
-                              - For concept names: use the shortest canonical form as it appears in the source (e.g., \"知识体系\" not \"某领域的知识体系构建研究\"). Do not add qualifiers unless they are part of the established term. If you see an \"Already-known concepts\" list in the user message, match against it first — prefer the exact existing name over a new variant.\n\
-                              - For events: use ISO date (YYYY-MM-DD or YYYY-MM or YYYY) only when the source explicitly gives a date; omit an event if its date is unknown. Never infer the current date.\n\
-                              - For events: exclude document metadata such as received/revised/accepted/publication dates, journal issue publication, acknowledgements, funding or project approval records, and the publication of this source article itself.\n\
-                              - For events: if the event is about a specific scholar or person you extracted as a figure, set figure_slug to \"research/figures/<slugified-name>\" (lowercase, spaces→hyphens, keep CJK as-is). If not tied to a person, leave figure_slug as empty string.\n\
-                              - Only extract entities with substantive presence in the text (not passing mentions).\n\
-                              Your response must be a raw JSON object (no markdown fences) conforming exactly to:\n\
+                let system = "You are a knowledge extractor. Extract key concepts, historical/scientific figures (people), and timeline events from the provided text.\n\
+                              Your response must be a JSON object conforming exactly to this structure:\n\
                               {\n\
                                 \"concepts\": [\n\
-                                  { \"name\": \"Concept Name\", \"description\": \"Definition or role as used in source: <slug>\", \"context\": \"Relevant text snippet\" }\n\
+                                  { \"name\": \"Concept Name\", \"description\": \"Short description of concept based on the text\", \"context\": \"Relevant text snippet\" }\n\
                                 ],\n\
                                 \"figures\": [\n\
-                                  { \"name\": \"Full Name\", \"description\": \"Institution/role/field — do NOT say 本文作者\", \"context\": \"Relevant text snippet\" }\n\
+                                  { \"name\": \"Figure Name\", \"description\": \"Short description of figure\", \"context\": \"Relevant text snippet\" }\n\
                                 ],\n\
                                 \"events\": [\n\
-                                  { \"date\": \"YYYY-MM-DD\", \"description\": \"Event description\", \"context\": \"Relevant text snippet\", \"figure_slug\": \"research/figures/姓名 or empty\" }\n\
+                                  { \"date\": \"YYYY-MM-DD\", \"description\": \"Short description of event\", \"context\": \"Relevant text snippet\" }\n\
                                 ]\n\
-                              }";
+                              }\n\
+                              Do not include any Markdown wrapping like ```json or anything else. Just the raw JSON string.";
 
-                // Fetch existing concept titles so LLM can normalize to known names
-                let existing_concepts: Vec<String> = sqlx::query_scalar(
-                    "SELECT title FROM pages WHERE page_type = 'concept' AND title != '' ORDER BY title"
-                )
-                .fetch_all(&self.inner.db)
-                .await
-                .unwrap_or_default();
-
-                let display_title = if title.trim().is_empty() { slug.as_str() } else { title.as_str() };
-                let known_concepts_block = if existing_concepts.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "\n\nAlready-known concepts (if a concept you extract is semantically equivalent to one of these, use that EXACT name — do NOT create a variant):\n{}",
-                        existing_concepts.iter().map(|s| format!("- {}", s)).collect::<Vec<_>>().join("\n")
-                    )
-                };
-                let user = format!("Source slug: {}\nTitle: {}\nType: {}{}\n\nContent:\n{}", slug, display_title, page_type, known_concepts_block, compiled_truth);
+                let user = format!(
+                    "Title: {}\nType: {}\n\nContent:\n{}",
+                    title, page_type, compiled_truth
+                );
                 match client.chat(system, &user).await {
                     Ok(resp) => {
                         let cleaned = clean_json(&resp);
                         match serde_json::from_str::<ExtractedKnowledge>(cleaned) {
                             Ok(k) => k,
                             Err(e) => {
-                                eprintln!("    WARN: failed to parse JSON from LLM: {}. Response was: {}", e, resp);
-                                continue;
+                                eprintln!(
+                                    "    WARN: failed to parse JSON from LLM: {}. Response was: {}. Falling back to mock extraction.",
+                                    e, resp
+                                );
+                                let page = Page {
+                                    slug: slug.clone(),
+                                    page_type: page_type.clone(),
+                                    title: title.clone(),
+                                    tags: Vec::new(),
+                                    frontmatter: serde_json::Value::Object(serde_json::Map::new()),
+                                    compiled_truth: compiled_truth.clone(),
+                                    timeline: timeline.clone(),
+                                    schema_version: PageSchema::CURRENT_VERSION,
+                                    language: None,
+                                    created_at: chrono::Utc::now(),
+                                    updated_at: chrono::Utc::now(),
+                                    content_hash: String::new(),
+                                };
+                                self.mock_extract_knowledge(&page)
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("    WARN: LLM chat call failed: {}", e);
-                        continue;
+                        eprintln!(
+                            "    WARN: LLM chat call failed: {}. Falling back to mock extraction.",
+                            e
+                        );
+                        let page = Page {
+                            slug: slug.clone(),
+                            page_type: page_type.clone(),
+                            title: title.clone(),
+                            tags: Vec::new(),
+                            frontmatter: serde_json::Value::Object(serde_json::Map::new()),
+                            compiled_truth: compiled_truth.clone(),
+                            timeline: timeline.clone(),
+                            schema_version: PageSchema::CURRENT_VERSION,
+                            language: None,
+                            created_at: chrono::Utc::now(),
+                            updated_at: chrono::Utc::now(),
+                            content_hash: String::new(),
+                        };
+                        self.mock_extract_knowledge(&page)
                     }
                 }
             } else {
@@ -2595,6 +2877,7 @@ impl Engine {
                     frontmatter: serde_json::Value::Object(serde_json::Map::new()),
                     compiled_truth: compiled_truth.clone(),
                     timeline: timeline.clone(),
+                    schema_version: PageSchema::CURRENT_VERSION,
                     language: None,
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
@@ -2602,145 +2885,118 @@ impl Engine {
                 };
                 self.mock_extract_knowledge(&page)
             };
-            
+
             // 1. Save extracted concepts
             for concept in &knowledge.concepts {
                 if concept.name.trim().is_empty() {
                     continue;
                 }
-                let concept_slug = format!("research/concepts/{}", slugify(&concept.name));
-                let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pages WHERE slug = ?1")
-                    .bind(&concept_slug)
-                    .fetch_one(&self.inner.db)
-                    .await
-                    .unwrap_or(0) > 0;
-                    
+                let concept_slug = format!("concepts/{}", slugify(&concept.name));
+                let exists =
+                    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pages WHERE slug = ?1")
+                        .bind(&concept_slug)
+                        .fetch_one(&self.inner.db)
+                        .await
+                        .unwrap_or(0)
+                        > 0;
+
                 if !exists {
-                    let mut cp = Page::new(concept_slug.clone(), "concept".to_string(), concept.description.clone());
+                    let concept_page = Page::new(
+                        concept_slug.clone(),
+                        "concept".to_string(),
+                        concept.description.clone(),
+                    );
+                    let mut cp = concept_page;
                     cp.title = concept.name.clone();
-                    cp.language = Some(rbrain_core::page::Language::detect(&concept.description));
                     self.put_page(cp).await?;
                     println!("    Created concept page: {}", concept_slug);
-                } else if !concept.description.trim().is_empty() {
-                    // Enrich existing concept page with new source's perspective
-                    if let Ok(mut existing_page) = self.get_page(&concept_slug).await {
-                        let append = format!(
-                            "\n\n---\n\n*来源：[[{}]]*\n\n{}",
-                            slug,
-                            concept.description.trim()
-                        );
-                        existing_page.compiled_truth.push_str(&append);
-                        self.put_page(existing_page).await.ok();
-                        println!("    Enriched concept page: {}", concept_slug);
-                    }
                 }
 
-                // Link source -> concept (anchor to chunk if context can be located)
-                let link_ctx = if concept.context.is_empty() { None } else { Some(concept.context.clone()) };
-                let chunk_id = self.find_chunk_id_for_context(&slug, &concept.context).await;
-                if let Err(e) = self.add_link(&slug, &concept_slug, "related", link_ctx.as_deref(), chunk_id).await {
-                    eprintln!("    WARN: failed to create link from {} to {}: {}", slug, concept_slug, e);
+                // Link source -> concept
+                let link_ctx = if concept.context.is_empty() {
+                    None
+                } else {
+                    Some(concept.context.clone())
+                };
+                if let Err(e) = self
+                    .add_link(&slug, &concept_slug, "related", link_ctx.as_deref(), None)
+                    .await
+                {
+                    eprintln!(
+                        "    WARN: failed to create link from {} to {}: {}",
+                        slug, concept_slug, e
+                    );
                 }
             }
-            
+
             // 2. Save extracted figures
             for figure in &knowledge.figures {
                 if figure.name.trim().is_empty() {
                     continue;
                 }
-                let figure_slug = format!("research/figures/{}", slugify(&figure.name));
-                let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pages WHERE slug = ?1")
-                    .bind(&figure_slug)
-                    .fetch_one(&self.inner.db)
-                    .await
-                    .unwrap_or(0) > 0;
-                    
+                let figure_slug = format!("figures/{}", slugify(&figure.name));
+                let exists =
+                    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pages WHERE slug = ?1")
+                        .bind(&figure_slug)
+                        .fetch_one(&self.inner.db)
+                        .await
+                        .unwrap_or(0)
+                        > 0;
+
                 if !exists {
-                    let mut fp = Page::new(figure_slug.clone(), "figure".to_string(), figure.description.clone());
+                    let figure_page = Page::new(
+                        figure_slug.clone(),
+                        "figure".to_string(),
+                        figure.description.clone(),
+                    );
+                    let mut fp = figure_page;
                     fp.title = figure.name.clone();
-                    fp.language = Some(rbrain_core::page::Language::detect(&figure.description));
                     self.put_page(fp).await?;
                     println!("    Created figure page: {}", figure_slug);
                 }
-                
-                // Link source -> figure (anchor to chunk if context can be located)
-                let link_ctx = if figure.context.is_empty() { None } else { Some(figure.context.clone()) };
-                let chunk_id = self.find_chunk_id_for_context(&slug, &figure.context).await;
-                if let Err(e) = self.add_link(&slug, &figure_slug, "related", link_ctx.as_deref(), chunk_id).await {
-                    eprintln!("    WARN: failed to create link from {} to {}: {}", slug, figure_slug, e);
+
+                // Link source -> figure
+                let link_ctx = if figure.context.is_empty() {
+                    None
+                } else {
+                    Some(figure.context.clone())
+                };
+                if let Err(e) = self
+                    .add_link(&slug, &figure_slug, "related", link_ctx.as_deref(), None)
+                    .await
+                {
+                    eprintln!(
+                        "    WARN: failed to create link from {} to {}: {}",
+                        slug, figure_slug, e
+                    );
                 }
             }
-            
-            // 3. Save extracted events on a related figure page when possible.
-            // Otherwise preserve them on a derived evidence page. Source notes,
-            // especially raw articles, are immutable evidence and must not receive
-            // generated timeline material.
+
+            // 3. Save extracted events
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
             for event in &knowledge.events {
                 if event.description.trim().is_empty() {
                     continue;
                 }
-                if let Some(reason) = extracted_event_rejection_reason(event) {
+                let date_str = if event.date.trim().is_empty() {
+                    &today
+                } else {
+                    &event.date
+                };
+                let event_src = Some(title.as_str());
+                if let Err(e) = self
+                    .add_timeline_entry(&slug, date_str, &event.description, event_src)
+                    .await
+                {
+                    eprintln!("    WARN: failed to add timeline entry to {}: {}", slug, e);
+                } else {
                     println!(
-                        "    Skipped timeline event ({}): {}",
-                        reason,
-                        event.description.trim()
+                        "    Added timeline event: {} on {}",
+                        event.description, date_str
                     );
-                    continue;
-                }
-                let date_str = event.date.trim();
-                let event_src = Some(slug.as_str());
-
-                let fig = event.figure_slug.trim();
-                let fig_exists = if fig.is_empty() {
-                    false
-                } else {
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM pages WHERE slug = ?1"
-                    )
-                    .bind(fig)
-                    .fetch_one(&self.inner.db)
-                    .await
-                    .unwrap_or(0) > 0
-                };
-                let target_slug = if fig_exists {
-                    fig.to_string()
-                } else {
-                    let evidence_slug = format!("research/evidence/events/{}", slug);
-                    let evidence_exists = sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM pages WHERE slug = ?1"
-                    )
-                    .bind(&evidence_slug)
-                    .fetch_one(&self.inner.db)
-                    .await
-                    .unwrap_or(0) > 0;
-                    if !evidence_exists {
-                        let display_title = if title.trim().is_empty() { slug.as_str() } else { title.as_str() };
-                        let body = format!(
-                            "从来源文献 `{}` 自动抽取的时间线证据记录。\n\n\
-                             本页为研究辅助材料，事件表述需回到原文核验。",
-                            slug
-                        );
-                        let mut ep = Page::new(evidence_slug.clone(), "evidence".to_string(), body);
-                        ep.title = format!("事件证据：{}", display_title);
-                        ep.language = Some(rbrain_core::page::Language::detect(&ep.compiled_truth));
-                        self.put_page(ep).await?;
-                        println!("    Created event evidence page: {}", evidence_slug);
-                    }
-                    let link_ctx = if event.context.is_empty() { None } else { Some(event.context.as_str()) };
-                    let chunk_id = self.find_chunk_id_for_context(&slug, &event.context).await;
-                    if let Err(e) = self.add_link(&evidence_slug, &slug, "evidence", link_ctx, chunk_id).await {
-                        eprintln!("    WARN: failed to link event evidence {} to {}: {}", evidence_slug, slug, e);
-                    }
-                    evidence_slug
-                };
-
-                if let Err(e) = self.add_timeline_entry(&target_slug, date_str, &event.description, event_src).await {
-                    eprintln!("    WARN: failed to add timeline entry to {}: {}", target_slug, e);
-                } else {
-                    println!("    Added timeline event to {}: {} on {}", target_slug, event.description, date_str);
                 }
             }
-            
+
             // Update dream_metadata
             sqlx::query("INSERT OR REPLACE INTO dream_metadata (slug, last_extracted_at) VALUES (?1, datetime('now'))")
                 .bind(&slug)
@@ -2748,192 +3004,147 @@ impl Engine {
                 .await
                 .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         }
-        
+
         Ok(())
     }
 
     async fn dream_synthesize(&self) -> Result<()> {
-        println!("\n[Dream Cycle] Phase 4: Synthesizing concept-based literature reviews...");
+        println!("\n[Dream Cycle] Phase 4: Synthesizing tag-based literature reviews...");
 
-        // Collect all concept pages
-        let all_pages = self.list_pages(None, None).await?;
-        let concept_pages: Vec<Page> = all_pages.into_iter()
-            .filter(|p| p.page_type == "concept")
-            .collect();
+        let pages = self.list_pages(None, None).await?;
+        let mut unique_tags = HashSet::new();
+        for page in &pages {
+            for tag in &page.tags {
+                unique_tags.insert(tag.clone());
+            }
+        }
 
-        if concept_pages.is_empty() {
-            println!("  No concept pages found. Run dream --stage extract first.");
+        if unique_tags.is_empty() {
+            println!("  No tags found in knowledge base.");
             return Ok(());
         }
 
         let deepseek = self.inner.deepseek.as_ref();
-        let mut synthesized = 0usize;
 
-        for concept in &concept_pages {
-            // Find source notes that link to this concept (page_type = 'note' only)
-            let source_slugs: Vec<String> = sqlx::query_scalar(
-                "SELECT DISTINCT l.source_slug FROM links l
-                 JOIN pages p ON p.slug = l.source_slug
-                 WHERE l.target_slug = ?1
-                 AND p.page_type = 'note'"
-            )
-            .bind(&concept.slug)
-            .fetch_all(&self.inner.db)
-            .await
-            .unwrap_or_default();
+        for tag in unique_tags {
+            let tag_pages = self.list_pages(None, Some(&tag)).await?;
+            let source_pages: Vec<Page> = tag_pages
+                .into_iter()
+                .filter(|p| {
+                    !p.slug.starts_with("synthesis/")
+                        && p.page_type != "concept"
+                        && p.page_type != "figure"
+                })
+                .collect();
 
-            // Require at least 3 distinct source articles to synthesize
-            if source_slugs.len() < 3 {
+            if source_pages.len() < 2 {
                 continue;
             }
 
-            // Fetch the actual source pages
-            let mut source_pages: Vec<Page> = Vec::new();
-            for s in &source_slugs {
-                if let Ok(p) = self.get_page(s).await {
-                    source_pages.push(p);
-                }
-            }
-
-            let synthesis_slug = format!("research/synthesis/{}", concept.slug.trim_start_matches("research/concepts/"));
+            let synthesis_slug = format!("synthesis/tag-{}", slugify(&tag));
             let existing_synth = self.get_page(&synthesis_slug).await.ok();
 
-            // Staleness check: re-synthesize if any source is newer than the synthesis
             let mut is_stale = true;
             if let Some(ref synth) = existing_synth {
                 let synth_updated = synth.updated_at;
-                let max_source_updated = source_pages.iter()
-                    .map(|p| p.updated_at)
-                    .max()
-                    .unwrap_or(synth_updated);
+                let mut max_source_updated = synth_updated;
+                for p in &source_pages {
+                    if p.updated_at > max_source_updated {
+                        max_source_updated = p.updated_at;
+                    }
+                }
                 if max_source_updated <= synth_updated {
                     is_stale = false;
                 }
             }
 
             if !is_stale {
-                println!("  Synthesis for '{}' is up to date.", concept.slug);
+                println!("  Synthesis for tag '{}' is up to date.", tag);
                 continue;
             }
 
-            println!("  Synthesizing '{}' ({} source articles)...", concept.slug, source_pages.len());
-
-            let concept_desc = if concept.compiled_truth.is_empty() {
-                concept.title.clone()
-            } else {
-                let mut idx = 500;
-                while idx > 0 && !concept.compiled_truth.is_char_boundary(idx) { idx -= 1; }
-                concept.compiled_truth[..idx.min(concept.compiled_truth.len())].to_string()
-            };
+            println!(
+                "  Synthesizing tag '{}' ({} pages)...",
+                tag,
+                source_pages.len()
+            );
 
             let synthesized_content = if let Some(client) = deepseek {
-
-                let system = "You are an academic research synthesizer. \
-                    Given a concept and source article chunks (each labelled with its chunk ID), \
-                    generate a structured literature synthesis page. \
-                    You MUST cite sources using Wikilinks [[slug | chunk:N]] where N is the exact chunk ID shown in the context. \
-                    Never cite just [[slug]] without a chunk ID — the chunk ID is required for traceability. \
-                    Structure with Markdown: H1 title, ## sections for themes/debates/evidence, \
-                    a ## Working Judgment section with your synthesis, \
-                    and a ## Open Questions section. \
-                    Output in the language of the source materials (Simplified Chinese for Chinese sources).";
+                let system = format!(
+                    "You are an academic research synthesizer. Generate a literature synthesis page for the tag: {}.\n\
+                                      Integrate the key findings, methodologies, and connections from the provided research pages.\n\
+                                      You MUST reference the source pages using Wikilinks [[slug]] to map them in the knowledge graph.\n\
+                                      Structure the synthesis nicely with Markdown:\n\
+                                      - Main H1 title\n\
+                                      - Headings (##) explaining common themes, debates, or progress\n\
+                                      - Clear connections between sources\n\
+                                      - Output in the language of the source materials (Simplified Chinese for Chinese pages).",
+                    tag
+                );
 
                 let mut context_items = Vec::new();
                 for p in &source_pages {
-                    let db_chunks: Vec<(i64, String)> = sqlx::query(
-                        "SELECT id, text FROM chunks WHERE page_slug = ?1 AND is_compiled_truth = 1 ORDER BY chunk_idx"
-                    )
-                    .bind(&p.slug)
-                    .fetch_all(&self.inner.db)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|r| {
-                        use sqlx::Row;
-                        (r.get::<i64, _>("id"), r.get::<String, _>("text"))
-                    })
-                    .collect();
-
-                    if db_chunks.is_empty() {
-                        // Fallback: page not yet chunked, use text snippet
-                        let mut idx = 800;
-                        while idx > 0 && !p.compiled_truth.is_char_boundary(idx) { idx -= 1; }
-                        let snippet = p.compiled_truth[..idx.min(p.compiled_truth.len())].to_string();
-                        context_items.push(format!("Source: [[{}]] ({})\n{}", p.slug, p.title, snippet));
+                    let snippet = if p.compiled_truth.len() > 1000 {
+                        &p.compiled_truth[..1000]
                     } else {
-                        let chunk_blocks: Vec<String> = db_chunks.iter()
-                            .map(|(id, text)| format!("[chunk:{}] {}", id, text))
-                            .collect();
-                        context_items.push(format!(
-                            "Source: {} ({})\n{}",
-                            p.slug, p.title,
-                            chunk_blocks.join("\n")
-                        ));
-                    }
+                        &p.compiled_truth
+                    };
+                    context_items.push(format!(
+                        "Page: [[{}]] (Title: {})\nContent snippet:\n{}",
+                        p.slug, p.title, snippet
+                    ));
                 }
-
                 let user = format!(
-                    "Concept: {} (slug: {})\nDescription: {}\n\nSource Articles:\n\n{}",
-                    concept.title, concept.slug, concept_desc,
+                    "Tag: {}\n\nRelated Pages:\n\n{}",
+                    tag,
                     context_items.join("\n\n---\n\n")
                 );
-
-                match client.chat(system, &user).await {
+                match client.chat(&system, &user).await {
                     Ok(resp) => resp,
                     Err(e) => {
-                        eprintln!("    WARN: LLM call failed for {}: {}. Using mock.", concept.slug, e);
-                        self.generate_mock_concept_synthesis(concept, &source_pages)
+                        eprintln!(
+                            "    WARN: LLM chat call failed for synthesis: {}. Falling back to mock synthesis.",
+                            e
+                        );
+                        self.generate_mock_synthesis(&tag, &source_pages)
                     }
                 }
             } else {
-                self.generate_mock_concept_synthesis(concept, &source_pages)
+                self.generate_mock_synthesis(&tag, &source_pages)
             };
 
-            let mut synth_page = Page::new(synthesis_slug.clone(), "synthesis".to_string(), synthesized_content);
-            synth_page.title = format!("综合分析：{}", concept.title);
-            synth_page.tags = concept.tags.clone();
-            synth_page.language = Some(rbrain_core::page::Language::detect(&synth_page.compiled_truth));
+            let mut synth_page = Page::new(
+                synthesis_slug.clone(),
+                "wiki".to_string(),
+                synthesized_content,
+            );
+            synth_page.title = format!("Synthesis: {}", tag);
+            synth_page.tags = vec![tag.clone()];
 
             self.put_page(synth_page.clone()).await?;
-            println!("    Saved: {}", synthesis_slug);
+            println!("    Saved synthesis page: {}", synthesis_slug);
 
+            // Re-embed the synthesis page if possible
             if self.has_embedder() {
                 if let Err(e) = self.chunk_and_embed_page(&synth_page).await {
-                    eprintln!("    WARN: failed to embed {}: {}", synthesis_slug, e);
+                    eprintln!("    WARN: failed to embed synthesis page: {}", e);
                 }
             }
-
-            // Link the synthesis back to the concept and its sources
-            let _ = self.add_link(&synthesis_slug, &concept.slug, "develops", Some(&concept_desc), None).await;
-            for p in &source_pages {
-                let ctx = format!("{} ({})", p.title, p.slug);
-                let _ = self.add_link(&synthesis_slug, &p.slug, "evidence", Some(&ctx), None).await;
-            }
-
-            synthesized += 1;
-        }
-
-        if synthesized == 0 {
-            println!("  No concepts had 3+ source articles. Nothing synthesized.");
-        } else {
-            println!("  Synthesized {} concept(s).", synthesized);
         }
 
         Ok(())
     }
-    
-    fn generate_mock_concept_synthesis(&self, concept: &Page, source_pages: &[Page]) -> String {
-        let mut md = format!("# 综合分析：{}\n\n", concept.title);
-        md.push_str("## 概念说明\n\n");
-        md.push_str(&format!("{}\n\n", concept.compiled_truth));
-        md.push_str("## 核心文献\n\n");
+
+    fn generate_mock_synthesis(&self, tag: &str, source_pages: &[Page]) -> String {
+        let mut md = format!("# Tag: {} Research Synthesis\n\n", tag);
+        md.push_str("This is a synthesized literature review created in offline mock mode.\n\n");
+        md.push_str("## Core Literature\n\n");
         for p in source_pages {
             md.push_str(&format!("- [[{}]] — **{}**\n", p.slug, p.title));
         }
-        md.push_str("\n## 工作判断\n\n");
-        md.push_str("（待 LLM 综合分析）\n\n");
-        md.push_str("## 开放问题\n\n");
-        md.push_str("（待补充）\n");
+        md.push_str("\n## Key Insights\n\n");
+        md.push_str("- **Common Methodology**: The literature shows significant overlap in the methods used.\n");
+        md.push_str("- **Research Progression**: Future directions point toward integration of these approaches.\n");
         md
     }
 
@@ -2946,23 +3157,33 @@ impl Engine {
         if text.contains("预训练") || text.contains("pretrained") {
             concepts.push(ExtractedConcept {
                 name: "预训练语言模型".to_string(),
-                description: "Pre-trained Language Models (PLMs) that are trained on large scale corpora.".to_string(),
+                description:
+                    "Pre-trained Language Models (PLMs) that are trained on large scale corpora."
+                        .to_string(),
                 context: "近年来，预训练语言模型在自然语言处理领域取得了显著的进展。".to_string(),
             });
             figures.push(ExtractedFigure {
                 name: "BERT".to_string(),
-                description: "A popular bidirectional encoder representation model from Google.".to_string(),
-                context: "对比了基于BERT and RoBERTa等不同架构的模型在多个数据集上的表现。".to_string(),
+                description: "A popular bidirectional encoder representation model from Google."
+                    .to_string(),
+                context: "对比了基于BERT and RoBERTa等不同架构的模型在多个数据集上的表现。"
+                    .to_string(),
             });
             events.push(ExtractedEvent {
                 date: "2018-10-11".to_string(),
-                description: "BERT model was officially released by Google researchers.".to_string(),
-                context: "本研究针对中文文本分类任务，对比了基于BERT和RoBERTa等不同架构的模型表现。".to_string(),
-                figure_slug: "research/figures/bert".to_string(),
+                description: "BERT model was officially released by Google researchers."
+                    .to_string(),
+                context:
+                    "本研究针对中文文本分类任务，对比了基于BERT和RoBERTa等不同架构的模型表现。"
+                        .to_string(),
             });
         } else {
             let words: Vec<&str> = page.title.split_whitespace().collect();
-            let name = if !words.is_empty() { words[0] } else { "Mock Concept" };
+            let name = if !words.is_empty() {
+                words[0]
+            } else {
+                "Mock Concept"
+            };
             concepts.push(ExtractedConcept {
                 name: format!("Concept {}", name),
                 description: format!("A mock academic concept extracted for {}", page.title),
@@ -2977,414 +3198,14 @@ impl Engine {
                 date: "2026-05-24".to_string(),
                 description: format!("Mock milestone event for {}", page.title),
                 context: page.title.clone(),
-                figure_slug: String::new(),
             });
         }
 
-        ExtractedKnowledge { concepts, figures, events }
-    }
-
-    /// Rebuild the link index for a single page from its wikilink content (no re-embed).
-    /// Used by `rbrain extract --all` to repair malformed links after format changes.
-    pub async fn reindex_page_links(&self, slug: &str, content: &str) -> Result<usize> {
-        let normalized = Self::validated_slug(slug)?;
-        sqlx::query("DELETE FROM links WHERE source_slug = ?1 AND is_generated = 1")
-            .bind(&normalized)
-            .execute(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        let links = extract_links(content);
-        let count = links.len();
-        for link in links {
-            let cid = link.chunk_id.unwrap_or(-1);
-            sqlx::query(
-                "INSERT OR IGNORE INTO links \
-                 (source_slug, target_slug, edge_type, context, created_at, chunk_id, is_generated) \
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, 1)",
-            )
-            .bind(&normalized)
-            .bind(&link.target_slug)
-            .bind(&link.edge_type)
-            .bind(&link.context)
-            .bind(cid)
-            .execute(&self.inner.db)
-            .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        ExtractedKnowledge {
+            concepts,
+            figures,
+            events,
         }
-        Ok(count)
-    }
-
-    /// Audit citation quality of a page: checks for non-primary-source citations,
-    /// duplicate bibliography entries, orphan bibliography entries, and uncited wikilinks.
-    /// With fix=true, automatically removes duplicate and orphan bibliography entries.
-    pub async fn audit_citations(&self, slug: &str, fix: bool) -> Result<AuditReport> {
-        let normalized = MarkdownParser::normalize_slug(slug);
-        let page = self.get_page(&normalized).await?;
-
-        let mut findings: Vec<AuditFinding> = Vec::new();
-        let mut fixed: Vec<String> = Vec::new();
-
-        // ── Check 1: Citation type — flag draft/synthesis/wiki citations ──────────
-        let cited_links = extract_links(&page.compiled_truth);
-        let mut cited_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for link in &cited_links {
-            let slug_norm = MarkdownParser::normalize_slug(&link.target_slug);
-            cited_slugs.insert(slug_norm.clone());
-
-            let pt: Option<String> = sqlx::query_scalar(
-                "SELECT page_type FROM pages WHERE slug = ?1"
-            )
-            .bind(&slug_norm)
-            .fetch_optional(&self.inner.db)
-            .await
-            .unwrap_or(None);
-
-            if let Some(page_type) = pt {
-                if matches!(page_type.as_str(), "draft" | "synthesis" | "wiki") {
-                    let (severity, msg) = if page_type == "draft" {
-                        ("ERROR", format!("自引草稿: [[{}]] 是会话草稿，应替换为原始 raw 文章", slug_norm))
-                    } else {
-                        ("ERROR", format!("非原始文献: [[{}]] 是系统生成的 {} 页，应追溯至 raw 原始文章", slug_norm, page_type))
-                    };
-
-                    // Suggest replacements: first try direct outlinks to raw/note,
-                    // then try two-hop via concept pages (synthesis often links to concepts, not raw)
-                    let outlink_slugs: Vec<String> = sqlx::query_scalar(
-                        "SELECT DISTINCT l.target_slug FROM links l \
-                         JOIN pages p ON p.slug = l.target_slug \
-                         WHERE l.source_slug = ?1 AND p.page_type IN ('raw', 'note') \
-                         ORDER BY l.created_at DESC \
-                         LIMIT 5"
-                    )
-                    .bind(&slug_norm)
-                    .fetch_all(&self.inner.db)
-                    .await
-                    .unwrap_or_default();
-
-                    let outlink_slugs = if outlink_slugs.is_empty() {
-                        // Two-hop: synthesis → concept → raw/note
-                        sqlx::query_scalar(
-                            "SELECT DISTINCT l2.source_slug FROM links l1 \
-                             JOIN pages p1 ON p1.slug = l1.target_slug \
-                             JOIN links l2 ON l2.target_slug = l1.target_slug \
-                             JOIN pages p2 ON p2.slug = l2.source_slug \
-                             WHERE l1.source_slug = ?1 AND p1.page_type = 'concept' \
-                               AND p2.page_type IN ('raw', 'note') \
-                             ORDER BY l2.created_at DESC \
-                             LIMIT 5"
-                        )
-                        .bind(&slug_norm)
-                        .fetch_all(&self.inner.db)
-                        .await
-                        .unwrap_or_default()
-                    } else {
-                        outlink_slugs
-                    };
-
-                    let suggestion = if outlink_slugs.is_empty() {
-                        Some(format!("运行: rbrain backlinks {} 查找原始来源", slug_norm))
-                    } else {
-                        Some(format!("候选替换来源: {}", outlink_slugs.join(", ")))
-                    };
-
-                    findings.push(AuditFinding {
-                        severity,
-                        category: "citation_type",
-                        message: msg,
-                        suggestion,
-                        auto_fixable: false,
-                    });
-                }
-            }
-        }
-
-        // ── Parse bibliography section ─────────────────────────────────────────────
-        // Format: "[N] Title [Author] — raw/slug"
-        let bib_section = page.compiled_truth
-            .find("\n\n## 参考文献")
-            .map(|pos| &page.compiled_truth[pos..]);
-
-        let mut bib_entries: Vec<(usize, String, String)> = Vec::new(); // (num, title, slug)
-        if let Some(bib) = bib_section {
-            for line in bib.lines() {
-                let line = line.trim();
-                if let Some(rest) = line.strip_prefix('[') {
-                    if let Some(bracket_end) = rest.find(']') {
-                        if let Ok(num) = rest[..bracket_end].parse::<usize>() {
-                            let after = rest[bracket_end + 1..].trim().trim_start_matches(' ');
-                            const BIB_SEP: &str = " — ";
-                            if let Some(dash_pos) = after.rfind(BIB_SEP) {
-                                let title = after[..dash_pos].trim().to_string();
-                                let bib_slug = after[dash_pos + BIB_SEP.len()..].trim().to_string();
-                                bib_entries.push((num, title, bib_slug));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Normalize a slug for comparison: NFC + ASCII-ify curly quotes (which differ between
-        // wikilinks and bibliography entries due to editor/LLM differences).
-        let slug_key = |s: &str| -> String {
-            MarkdownParser::normalize_slug(s)
-                .replace('\u{201C}', "\"").replace('\u{201D}', "\"")
-                .replace('\u{2018}', "'").replace('\u{2019}', "'")
-        };
-
-        // ── Check 2: Duplicate bibliography entries ────────────────────────────────
-        let mut seen_bib_slugs: std::collections::HashMap<String, (usize, String)> = std::collections::HashMap::new();
-        for (num, _title, bib_slug) in &bib_entries {
-            let norm_key = slug_key(bib_slug);
-            if let Some((first_num, first_slug)) = seen_bib_slugs.get(&norm_key) {
-                findings.push(AuditFinding {
-                    severity: "WARN",
-                    category: "bib_duplicate",
-                    message: format!("重复参考文献: [{}] 与 [{}] 指向同一文章 {}", num, first_num, first_slug),
-                    suggestion: Some(format!("删除 [{}]，保留 [{}]", num, first_num)),
-                    auto_fixable: true,
-                });
-            } else {
-                seen_bib_slugs.insert(norm_key, (*num, bib_slug.clone()));
-            }
-        }
-
-        // ── Check 3: Orphan bibliography entries ──────────────────────────────────
-        // Use substring search in compiled_truth to avoid Unicode normalization
-        // mismatches (e.g., curly vs straight quotes in slugs with special chars)
-        let ct_nfc = MarkdownParser::normalize_slug(&page.compiled_truth);
-        // ct with ASCII-normalized quotes for matching curly-quote bib slugs
-        let ct_ascii_quotes = ct_nfc
-            .replace('\u{201C}', "\"").replace('\u{201D}', "\"")
-            .replace('\u{2018}', "'").replace('\u{2019}', "'");
-        for (_num, _title, bib_slug) in &bib_entries {
-            let norm_bib = slug_key(bib_slug);
-            // Check: does compiled_truth contain [[bib_slug (as a wikilink prefix)?
-            let wikilink_prefix = format!("[[{}", bib_slug);
-            let wikilink_prefix_norm = format!("[[{}", norm_bib);
-            let cited = page.compiled_truth.contains(wikilink_prefix.as_str())
-                || ct_nfc.contains(wikilink_prefix.as_str())
-                || ct_ascii_quotes.contains(wikilink_prefix_norm.as_str())
-                || cited_slugs.iter().any(|s| slug_key(s) == norm_bib);
-            if !cited {
-                findings.push(AuditFinding {
-                    severity: "WARN",
-                    category: "bib_orphan",
-                    message: format!("游离参考文献: {} 出现在参考文献列表但正文无引用", bib_slug),
-                    suggestion: Some("可删除此条目或在正文中补充引用".to_string()),
-                    auto_fixable: true,
-                });
-                // fix pass recomputes orphan_slugs independently; no tracking needed here
-            }
-        }
-
-        // ── Check 4: In-text citations not in bibliography ─────────────────────────
-        let bib_slug_set: std::collections::HashSet<String> = bib_entries.iter()
-            .map(|(_, _, s)| MarkdownParser::normalize_slug(s))
-            .collect();
-        for slug_ref in &cited_slugs {
-            if slug_ref.starts_with("raw/") || {
-                let pt: Option<String> = sqlx::query_scalar("SELECT page_type FROM pages WHERE slug = ?1")
-                    .bind(slug_ref).fetch_optional(&self.inner.db).await.unwrap_or(None);
-                pt.as_deref() == Some("note")
-            } {
-                let in_bib = bib_slug_set.contains(slug_ref)
-                    || bib_slug_set.iter().any(|b| b.ends_with(slug_ref.as_str()) || slug_ref.ends_with(b.as_str()));
-                if !in_bib && !bib_entries.is_empty() {
-                    findings.push(AuditFinding {
-                        severity: "INFO",
-                        category: "bib_missing",
-                        message: format!("未收录引用: [[{}]] 出现在正文但参考文献列表无此条目", slug_ref),
-                        suggestion: Some("运行 `rbrain cite --append` 更新参考文献".to_string()),
-                        auto_fixable: false,
-                    });
-                }
-            }
-        }
-
-        // ── --fix: Remove duplicate and orphan bibliography entries ───────────────
-        if fix && !bib_entries.is_empty() {
-            let orphan_slugs: std::collections::HashSet<String> = bib_entries.iter()
-                .filter(|(_, _, bib_slug)| {
-                    let norm = slug_key(bib_slug);
-                    let wl = format!("[[{}", bib_slug);
-                    let wl_norm = format!("[[{}", norm);
-                    !page.compiled_truth.contains(wl.as_str())
-                        && !ct_nfc.contains(wl.as_str())
-                        && !ct_ascii_quotes.contains(wl_norm.as_str())
-                        && !cited_slugs.iter().any(|s| slug_key(s) == norm)
-                })
-                .map(|(_, _, s)| s.clone())
-                .collect();
-
-            let mut kept: Vec<(usize, String, String)> = Vec::new();
-            let mut seen_for_fix: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for (num, title, bib_slug) in &bib_entries {
-                let norm = slug_key(bib_slug);
-                // Mark as removable if it's a duplicate (seen_for_fix already has this norm) or an orphan
-                if seen_for_fix.contains(&norm) || orphan_slugs.contains(bib_slug.as_str())
-                    || orphan_slugs.iter().any(|o| slug_key(o) == norm)
-                {
-                    fixed.push(format!("删除: [{}] {} — {}", num, title, bib_slug));
-                } else {
-                    seen_for_fix.insert(norm);
-                    kept.push((*num, title.clone(), bib_slug.clone()));
-                }
-            }
-
-            if kept.len() < bib_entries.len() {
-                // Rebuild bibliography section with renumbered entries
-                let mut new_bib = String::from("\n\n## 参考文献\n\n");
-                for (new_num, (_old_num, title, bib_slug)) in kept.iter().enumerate() {
-                    new_bib.push_str(&format!("[{}] {} — {}\n", new_num + 1, title, bib_slug));
-                }
-
-                let mut page_mut = self.get_page(&normalized).await?;
-                if let Some(pos) = page_mut.compiled_truth.find("\n\n## 参考文献") {
-                    page_mut.compiled_truth.truncate(pos);
-                }
-                page_mut.compiled_truth.push_str(&new_bib);
-                self.put_page(page_mut).await?;
-            }
-        }
-
-        Ok(AuditReport { slug: normalized, findings, fixed })
-    }
-
-    /// Traverse the citation graph from a page and collect original source pages (raw/ or notes/).
-    /// Returns a deduplicated list of source entries with their traversal path.
-    pub async fn cite(&self, slug: &str, depth: u8) -> Result<Vec<CiteEntry>> {
-        let normalized = MarkdownParser::normalize_slug(slug);
-        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut sources: Vec<CiteEntry> = Vec::new();
-        let mut queue: std::collections::VecDeque<(String, Vec<String>, u8)> = std::collections::VecDeque::new();
-
-        visited.insert(normalized.clone());
-        queue.push_back((normalized.clone(), vec![normalized.clone()], 0));
-
-        while let Some((current, path, current_depth)) = queue.pop_front() {
-            let links = self.outlinks(&current).await.unwrap_or_default();
-            for link in links {
-                let target = &link.target_slug;
-                if visited.contains(target) {
-                    continue;
-                }
-                visited.insert(target.clone());
-
-                let is_source = target.starts_with("raw/") || {
-                    // also include notes/ pages as primary sources
-                    let pt: Option<String> = sqlx::query_scalar(
-                        "SELECT page_type FROM pages WHERE slug = ?1"
-                    )
-                    .bind(target)
-                    .fetch_optional(&self.inner.db)
-                    .await
-                    .unwrap_or(None);
-                    pt.as_deref() == Some("note")
-                };
-
-                let mut new_path = path.clone();
-                new_path.push(target.clone());
-
-                if is_source {
-                    let stored_title: Option<String> = sqlx::query_scalar(
-                        "SELECT NULLIF(title, '') FROM pages WHERE slug = ?1"
-                    )
-                    .bind(target)
-                    .fetch_optional(&self.inner.db)
-                    .await
-                    .unwrap_or(None)
-                    .flatten();
-                    // If no stored title, derive from slug: last path segment, split on '_' for author
-                    let title = stored_title.unwrap_or_else(|| {
-                        let stem = target.rsplit('/').next().unwrap_or(target.as_str());
-                        if let Some(pos) = stem.rfind('_') {
-                            let article = &stem[..pos];
-                            let author = &stem[pos + 1..];
-                            format!("{} [{}]", article, author)
-                        } else {
-                            stem.to_string()
-                        }
-                    });
-
-                    let page_type = sqlx::query_scalar::<_, String>(
-                        "SELECT page_type FROM pages WHERE slug = ?1"
-                    )
-                    .bind(target)
-                    .fetch_optional(&self.inner.db)
-                    .await
-                    .unwrap_or(None)
-                    .unwrap_or_else(|| "note".to_string());
-
-                    sources.push(CiteEntry {
-                        slug: target.clone(),
-                        title,
-                        path: new_path,
-                        page_type,
-                    });
-                } else if current_depth < depth {
-                    queue.push_back((target.clone(), new_path, current_depth + 1));
-                }
-            }
-        }
-
-        Ok(sources)
-    }
-}
-
-/// A source entry collected during citation graph traversal.
-#[derive(Debug)]
-pub struct CiteEntry {
-    pub slug: String,
-    pub title: String,
-    pub path: Vec<String>,
-    pub page_type: String,
-}
-
-/// A single finding from `audit_citations`.
-#[derive(Debug)]
-pub struct AuditFinding {
-    pub severity: &'static str,
-    pub category: &'static str,
-    pub message: String,
-    pub suggestion: Option<String>,
-    pub auto_fixable: bool,
-}
-
-/// Result returned by `audit_citations`.
-#[derive(Debug)]
-pub struct AuditReport {
-    pub slug: String,
-    pub findings: Vec<AuditFinding>,
-    pub fixed: Vec<String>,
-}
-
-impl AuditReport {
-    pub fn format_text(&self) -> String {
-        let mut out = format!("Audit: {}\n", self.slug);
-        if self.findings.is_empty() && self.fixed.is_empty() {
-            out.push_str("✓ No issues found.\n");
-            return out;
-        }
-        if !self.fixed.is_empty() {
-            out.push_str("\n已自动修复:\n");
-            for f in &self.fixed {
-                out.push_str(&format!("  - {}\n", f));
-            }
-        }
-        let errors: Vec<_> = self.findings.iter().filter(|f| f.severity == "ERROR").collect();
-        let warns: Vec<_> = self.findings.iter().filter(|f| f.severity == "WARN").collect();
-        let infos: Vec<_> = self.findings.iter().filter(|f| f.severity == "INFO").collect();
-        for group in [errors, warns, infos] {
-            for f in group {
-                out.push_str(&format!("\n[{}] {}\n", f.severity, f.message));
-                if let Some(s) = &f.suggestion {
-                    out.push_str(&format!("  建议: {}\n", s));
-                }
-            }
-        }
-        out
     }
 }
 
@@ -3393,7 +3214,11 @@ fn update_frontmatter_tags(content: &str, tags: &[String]) -> String {
     let tags_yaml = if tags.is_empty() {
         "tags: []".to_string()
     } else {
-        let items = tags.iter().map(|t| format!("  - {}", t)).collect::<Vec<_>>().join("\n");
+        let items = tags
+            .iter()
+            .map(|t| format!("  - {}", t))
+            .collect::<Vec<_>>()
+            .join("\n");
         format!("tags:\n{}", items)
     };
 
@@ -3412,11 +3237,115 @@ fn compute_query_hash(query: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn sanitize_slug_part(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn render_validator_result(result: &ValidatorResult) -> Result<String> {
+    let affected = if result.affected_slugs.is_empty() {
+        "none".to_string()
+    } else {
+        result.affected_slugs.join(", ")
+    };
+    let actions = serde_json::to_string_pretty(&result.suggested_actions)?;
+    Ok(format!(
+        "# {} validation\n\nStatus: {}\n\n{}\n\nAffected: {}\n\nSuggested actions:\n\n```json\n{}\n```\n",
+        result.validator,
+        result.status.as_str(),
+        result.message,
+        affected,
+        actions
+    ))
+}
+
 pub struct GraphEdge {
     pub target: String,
     pub edge_type: String,
     pub depth: usize,
     pub context: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvenanceNode {
+    pub slug: String,
+    pub page_type: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvenanceEdge {
+    pub source_slug: String,
+    pub target_slug: String,
+    pub edge_type: String,
+    pub context: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvenanceGraph {
+    pub root_slug: String,
+    pub nodes: Vec<ProvenanceNode>,
+    pub edges: Vec<ProvenanceEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResearchProtocolPage {
+    pub slug: String,
+    pub page_type: String,
+    pub title: String,
+    pub frontmatter: serde_json::Value,
+}
+
+impl ResearchProtocolPage {
+    fn from_page(page: &Page) -> Self {
+        Self {
+            slug: page.slug.clone(),
+            page_type: page.page_type.clone(),
+            title: page.title.clone(),
+            frontmatter: page.frontmatter.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResearchProtocolEdge {
+    pub source_slug: String,
+    pub target_slug: String,
+    pub edge_type: String,
+    pub context: Option<String>,
+}
+
+impl ResearchProtocolEdge {
+    fn from_link(source_slug: &str, link: &LinkRef) -> Self {
+        Self {
+            source_slug: source_slug.to_string(),
+            target_slug: link.target_slug.clone(),
+            edge_type: link.edge_type.clone(),
+            context: link.context.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResearchProtocol {
+    pub run: ResearchProtocolPage,
+    pub inputs: Vec<ResearchProtocolPage>,
+    pub artifacts: Vec<ResearchProtocolPage>,
+    pub findings: Vec<ResearchProtocolPage>,
+    pub validation_reports: Vec<ResearchProtocolPage>,
+    pub action_items: Vec<ResearchProtocolPage>,
+    pub related: Vec<ResearchProtocolPage>,
+    pub edges: Vec<ResearchProtocolEdge>,
 }
 
 #[derive(Debug, Clone)]
@@ -3425,7 +3354,29 @@ pub struct ChunkResult {
     pub score: f64,
     pub text: String,
     pub page_slug: String,
-    pub page_type: String,
+}
+
+pub const MAX_POOL_DEFAULT: usize = 1;
+
+pub fn apply_page_cap(
+    iter: impl Iterator<Item = ChunkResult>,
+    max_chunks_per_page: usize,
+) -> Vec<ChunkResult> {
+    if max_chunks_per_page == 0 {
+        return iter.collect();
+    }
+
+    let mut page_chunk_count: HashMap<String, usize> = HashMap::new();
+    iter.filter(|chunk| {
+        let count = page_chunk_count.entry(chunk.page_slug.clone()).or_insert(0);
+        if *count < max_chunks_per_page {
+            *count += 1;
+            true
+        } else {
+            false
+        }
+    })
+    .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -3463,10 +3414,6 @@ struct ExtractedEvent {
     date: String,
     description: String,
     context: String,
-    /// Slug of the figure page this event belongs to (e.g. "research/figures/张三").
-    /// Empty string if the event is not attributed to a specific figure.
-    #[serde(default)]
-    figure_slug: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3479,7 +3426,7 @@ struct ExtractedKnowledge {
 fn clean_json(s: &str) -> &str {
     let mut s = s.trim();
     if s.starts_with("```") {
-        if let Some(end) = s.rfind("```").filter(|&e| e > 0) {
+        if let Some(end) = s.rfind("```") {
             s = &s[3..end];
             if s.starts_with("json") {
                 s = &s[4..];
@@ -3487,69 +3434,6 @@ fn clean_json(s: &str) -> &str {
         }
     }
     s.trim()
-}
-
-fn extracted_event_rejection_reason(event: &ExtractedEvent) -> Option<&'static str> {
-    let date = event.date.trim();
-    if date.is_empty() {
-        return Some("missing explicit date");
-    }
-    if !is_iso_event_date(date) {
-        return Some("invalid ISO date");
-    }
-
-    let candidate = format!("{} {}", event.description, event.context).to_lowercase();
-    const DOCUMENT_METADATA_MARKERS: &[&str] = &[
-        "收稿",
-        "修回",
-        "录用",
-        "出版日期",
-        "本文发表",
-        "本文出版",
-        "文章发表",
-        "论文发表",
-        "发表于",
-        "刊发",
-        "刊载",
-        "基金项目",
-        "项目立项",
-        "提供资助",
-        "received",
-        "revised",
-        "accepted",
-        "published in",
-    ];
-    // "期发表" covers "第N卷第M期发表某人的论文" — journal issue publication events.
-    // Do NOT use bare "发表" + "文章/论文": that would also reject genuine intellectual
-    // contribution events like "顾明远发表重要文章，提出...".
-    let source_publication_event = candidate.contains("期发表");
-    if source_publication_event
-        || DOCUMENT_METADATA_MARKERS
-            .iter()
-            .any(|marker| candidate.contains(marker))
-    {
-        return Some("document metadata");
-    }
-
-    None
-}
-
-fn is_derived_research_context(page_type: &str) -> bool {
-    matches!(
-        page_type,
-        "draft" | "synthesis" | "wiki" | "memo" | "concept" | "figure" | "evidence"
-    )
-}
-
-fn is_iso_event_date(date: &str) -> bool {
-    match date.len() {
-        4 => date
-            .parse::<i32>()
-            .is_ok_and(|year| (1..=9999).contains(&year)),
-        7 => chrono::NaiveDate::parse_from_str(&format!("{}-01", date), "%Y-%m-%d").is_ok(),
-        10 => chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok(),
-        _ => false,
-    }
 }
 
 fn slugify(s: &str) -> String {
@@ -3561,63 +3445,4 @@ fn slugify(s: &str) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("-")
-}
-
-#[cfg(test)]
-mod event_filter_tests {
-    use super::{ExtractedEvent, extracted_event_rejection_reason, is_derived_research_context};
-
-    fn event(date: &str, description: &str) -> ExtractedEvent {
-        ExtractedEvent {
-            date: date.to_string(),
-            description: description.to_string(),
-            context: description.to_string(),
-            figure_slug: String::new(),
-        }
-    }
-
-    #[test]
-    fn rejects_undated_and_invalid_dream_events() {
-        assert_eq!(
-            extracted_event_rejection_reason(&event("", "未标明日期的教育史叙述")),
-            Some("missing explicit date")
-        );
-        assert_eq!(
-            extracted_event_rejection_reason(&event("2026-13", "事件")),
-            Some("invalid ISO date")
-        );
-    }
-
-    #[test]
-    fn rejects_document_metadata_but_keeps_substantive_events() {
-        assert_eq!(
-            extracted_event_rejection_reason(&event("2025-10-30", "本文收稿日期")),
-            Some("document metadata")
-        );
-        assert_eq!(
-            extracted_event_rejection_reason(&event("2023", "国家社会科学基金项目立项，为本研究提供资助")),
-            Some("document metadata")
-        );
-        assert_eq!(
-            extracted_event_rejection_reason(&event("2024-11", "《高等教育研究》第45卷第11期发表郝文武、贺璐璐的论文")),
-            Some("document metadata")
-        );
-        assert_eq!(
-            extracted_event_rejection_reason(&event("2022-04-25", "提出建构中国自主的知识体系")),
-            None
-        );
-        assert_eq!(
-            extracted_event_rejection_reason(&event("2016-05-17", "习近平发表重要讲话，提出相关命题")),
-            None
-        );
-    }
-
-    #[test]
-    fn derived_research_pages_are_not_generation_sources() {
-        for page_type in ["draft", "synthesis", "wiki", "memo", "concept", "figure", "evidence"] {
-            assert!(is_derived_research_context(page_type));
-        }
-        assert!(!is_derived_research_context("note"));
-        assert!(!is_derived_research_context("book"));
-    }
 }

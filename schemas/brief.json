@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "brief frontmatter",
+  "type": "object",
+  "required": ["time_window", "corpus", "source_count"],
+  "properties": {
+    "type": { "const": "brief" },
+    "title": { "type": "string" },
+    "time_window": {
+      "type": "object",
+      "required": ["from", "to"],
+      "properties": {
+        "from": { "type": "string" },
+        "to": { "type": "string" }
+      }
+    },
+    "corpus": { "type": "string", "minLength": 1 },
+    "method": { "type": "string" },
+    "source_count": { "type": "integer" },
+    "created_by": { "type": "string" }
+  }
+}

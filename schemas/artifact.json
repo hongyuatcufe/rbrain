@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "artifact frontmatter",
+  "type": "object",
+  "required": ["artifact_kind", "path"],
+  "properties": {
+    "type": { "const": "artifact" },
+    "title": { "type": "string" },
+    "artifact_kind": { "type": "string", "minLength": 1 },
+    "path": { "type": "string", "minLength": 1 },
+    "hash": { "type": "string" },
+    "mime_type": { "type": "string" },
+    "stored_copy": { "type": "boolean" },
+    "research_run": { "type": "string" }
+  }
+}

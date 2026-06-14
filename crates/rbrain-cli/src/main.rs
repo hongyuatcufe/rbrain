@@ -3,6 +3,7 @@ use rbrain_core::config::Config;
 use rbrain_core::embedder::Embedder;
 use rbrain_core::markdown::MarkdownParser;
 use rbrain_core::page::Page;
+use rbrain_core::schema::TimelineEntry;
 use rbrain_engine::{Engine, extract_links};
 use rbrain_llm::mock::MockEmbedder;
 use rbrain_llm::qwen::QwenEmbedder;
@@ -39,17 +40,17 @@ enum Commands {
         r#type: Option<String>,
         #[arg(long, help = "Read content from file instead of stdin")]
         file: Option<String>,
-        #[arg(long, help = "Page content as a string (alternative to stdin/--file)", allow_hyphen_values = true)]
+        #[arg(
+            long,
+            help = "Page content as a string (alternative to stdin/--file)",
+            allow_hyphen_values = true
+        )]
         content: Option<String>,
     },
     /// Retrieve a page by slug and print its content
-    Get {
-        slug: String,
-    },
+    Get { slug: String },
     /// Delete a page and all its chunks/embeddings
-    Delete {
-        slug: String,
-    },
+    Delete { slug: String },
     /// List pages with optional type or tag filter
     List {
         #[arg(long, help = "Filter by page type (e.g. wiki, note, book)")]
@@ -64,7 +65,10 @@ enum Commands {
     /// Import all markdown files from a directory
     Import {
         dir: String,
-        #[arg(long, help = "Skip embedding after import (faster, do embed --all later)")]
+        #[arg(
+            long,
+            help = "Skip embedding after import (faster, do embed --all later)"
+        )]
         no_embed: bool,
     },
     /// Sync the repo directory with the database (detect new/changed/deleted files)
@@ -113,13 +117,9 @@ enum Commands {
         direction: String,
     },
     /// Show all pages that link to a given page (incoming links)
-    Backlinks {
-        slug: String,
-    },
+    Backlinks { slug: String },
     /// Show all pages this page links to (outgoing links with evidence context)
-    Links {
-        slug: String,
-    },
+    Links { slug: String },
     /// Add an explicit typed link from one page to another
     Link {
         /// Source page slug
@@ -146,28 +146,13 @@ enum Commands {
     },
     /// List pages with no incoming links (orphan pages not referenced by any other page)
     Orphans,
-    /// Generate bibliography from a page's citation graph (traverses outlinks to find raw sources)
-    Cite {
-        slug: String,
-        #[arg(long, default_value = "2", help = "Graph traversal depth")]
-        depth: u8,
-        #[arg(long, default_value = "plain", value_parser = ["plain", "bibtex"], help = "Output format")]
-        format: String,
-        #[arg(long, help = "Append bibliography to the page and save it back to the brain")]
-        append: bool,
-    },
-    /// Audit citation quality of a page: flags draft/synthesis citations, duplicate or orphan bibliography entries
-    Audit {
-        /// Slug of the page to audit
-        slug: String,
-        /// Auto-fix safe issues: remove duplicate and orphan bibliography entries
-        #[arg(long, help = "Auto-fix duplicate and orphan bibliography entries (does not replace citation slugs)")]
-        fix: bool,
-    },
     /// Hybrid search (vector + keyword + RRF), results grouped by page
     Query {
         query: String,
-        #[arg(long, help = "Use LLM query expansion for better recall (extra API call)")]
+        #[arg(
+            long,
+            help = "Use LLM query expansion for better recall (extra API call)"
+        )]
         expand: bool,
         #[arg(short, long, default_value = "10", help = "Max pages to return")]
         limit: usize,
@@ -189,12 +174,15 @@ enum Commands {
     /// Search relevant chunks and synthesise a wiki page via LLM (DeepSeek)
     Generate {
         topic: String,
-        #[arg(short, long, default_value = "8", help = "Number of chunks to use as context")]
+        #[arg(
+            short,
+            long,
+            default_value = "8",
+            help = "Number of chunks to use as context"
+        )]
         limit: usize,
         #[arg(long, help = "Save the generated page to the knowledge base")]
         save: bool,
-        #[arg(long, help = "Save as a draft (research/drafts/) instead of wiki (research/wiki/)")]
-        draft: bool,
         #[arg(long, help = "Use LLM query expansion for better recall")]
         expand: bool,
     },
@@ -221,9 +209,7 @@ enum Commands {
         kind: String,
     },
     /// List all takes (interpretive entries) for a page
-    Takes {
-        slug: String,
-    },
+    Takes { slug: String },
     /// Deep reasoning synthesis: search context + LLM reasoning artifact (contradictions, open questions, working judgment)
     Think {
         topic: String,
@@ -231,25 +217,15 @@ enum Commands {
         limit: usize,
         #[arg(long, help = "Save the reasoning artifact as a synthesis page")]
         save: bool,
-        #[arg(long, help = "Save as a draft (research/drafts/) instead of synthesis (research/synthesis/)")]
-        draft: bool,
         #[arg(long, help = "Use LLM query expansion for better recall")]
         expand: bool,
     },
     /// Add a tag to a page
-    Tag {
-        slug: String,
-        tag: String,
-    },
+    Tag { slug: String, tag: String },
     /// Remove a tag from a page
-    Untag {
-        slug: String,
-        tag: String,
-    },
+    Untag { slug: String, tag: String },
     /// List all tags on a page
-    Tags {
-        slug: String,
-    },
+    Tags { slug: String },
     /// Export pages to a directory (--format md or json)
     Export {
         #[arg(long, default_value = "/tmp/rbrain-export", help = "Output directory")]
@@ -288,7 +264,10 @@ enum Commands {
     },
     /// Run autonomous dream cycle (lint -> embed -> extract -> synthesize)
     Dream {
-        #[arg(long, help = "Only run a specific stage of the dream cycle (lint, embed, extract, synthesize)")]
+        #[arg(
+            long,
+            help = "Only run a specific stage of the dream cycle (lint, embed, extract, synthesize)"
+        )]
         stage: Option<String>,
     },
 }
@@ -309,8 +288,12 @@ enum JobsAction {
         #[arg(long)]
         limit: Option<usize>,
     },
-    Get { id: i64 },
-    Cancel { id: i64 },
+    Get {
+        id: i64,
+    },
+    Cancel {
+        id: i64,
+    },
     Work {
         #[arg(long, default_value = "1")]
         concurrency: usize,
@@ -337,9 +320,7 @@ enum ConfigAction {
     /// Show all configuration values (API keys redacted)
     Show,
     /// Get a specific configuration value by key (e.g. models.think, deepseek.model)
-    Get {
-        key: String,
-    },
+    Get { key: String },
 }
 
 #[tokio::main]
@@ -375,25 +356,6 @@ async fn main() -> anyhow::Result<()> {
             // Add .rbrain/ to .gitignore so DB files are never committed.
             update_gitignore(&cwd)?;
 
-            // Create standard content directory scaffold.
-            let content_dirs = [
-                "raw",
-                "notes",
-                "research/concepts",
-                "research/figures",
-                "research/synthesis",
-                "research/wiki",
-                "research/drafts",
-            ];
-            for d in &content_dirs {
-                let p = cwd.join(d);
-                std::fs::create_dir_all(&p)?;
-                let gitkeep = p.join(".gitkeep");
-                if !gitkeep.exists() {
-                    std::fs::write(&gitkeep, "")?;
-                }
-            }
-
             let config = load_config!();
             Engine::open(config.clone()).await?;
 
@@ -402,17 +364,13 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 println!("Brain initialised (global): {}", config.data_dir.display());
             }
-            println!("Directory structure created:");
-            println!("  raw/                  ← place source articles here");
-            println!("  notes/                ← manual research notes");
-            println!("  research/concepts/    ← auto-generated by dream extract");
-            println!("  research/figures/     ← auto-generated by dream extract");
-            println!("  research/synthesis/   ← auto-generated by dream synthesize / think --save");
-            println!("  research/wiki/        ← auto-generated by generate --save");
-            println!("  research/drafts/      ← think --save --draft / generate --save --draft");
-            println!("Next: copy source .md files into raw/, then run: rbrain sync");
         }
-        Commands::Put { slug, r#type, file, content: content_flag } => {
+        Commands::Put {
+            slug,
+            r#type,
+            file,
+            content: content_flag,
+        } => {
             let config = load_config!();
             // Use search engine so we can re-embed after saving.
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
@@ -430,7 +388,13 @@ async fn main() -> anyhow::Result<()> {
             // Parse frontmatter so that type/title/tags/timeline are extracted correctly.
             let parse_result = MarkdownParser::parse(&content);
             let page_type = r#type
-                .or_else(|| parse_result.frontmatter.get("type").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .or_else(|| {
+                    parse_result
+                        .frontmatter
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
                 .unwrap_or_else(|| "note".to_string());
 
             let mut page = Page::new(slug, page_type, parse_result.compiled_truth);
@@ -440,7 +404,10 @@ async fn main() -> anyhow::Result<()> {
             // Extract tags from frontmatter if present
             if let Some(tags_val) = parse_result.frontmatter.get("tags") {
                 if let Some(arr) = tags_val.as_array() {
-                    page.tags = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                    page.tags = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
                 }
             }
 
@@ -462,7 +429,10 @@ async fn main() -> anyhow::Result<()> {
                 eprint!("Embedding… ");
                 match engine.chunk_and_embed_page(&page).await {
                     Ok(_) => eprintln!("done."),
-                    Err(e) => eprintln!("warning: embed failed ({}). Run `rbrain embed {}` manually.", e, page.slug),
+                    Err(e) => eprintln!(
+                        "warning: embed failed ({}). Run `rbrain embed {}` manually.",
+                        e, page.slug
+                    ),
                 }
             }
         }
@@ -473,18 +443,20 @@ async fn main() -> anyhow::Result<()> {
             match engine.find_page_fuzzy(&slug).await {
                 Ok((page, score)) => {
                     if score < 1.0 {
-                        eprintln!("No exact match found for '{}'. Using best match: '{}' (similarity: {:.2})",
-                            slug, page.slug, score);
+                        eprintln!(
+                            "No exact match found for '{}'. Using best match: '{}' (similarity: {:.2})",
+                            slug, page.slug, score
+                        );
                     }
                     println!("Slug: {}", page.slug);
                     println!("Title: {}", page.title);
                     println!("Type: {}", page.page_type);
                     println!("Tags: {}", page.tags.join(", "));
-                    println!("Language: {}", page.language.as_ref().map(|l| l.to_string()).unwrap_or_default());
+                    println!("Language: {:?}", page.language);
                     println!("Updated: {}", page.updated_at);
                     println!("\n{}", page.compiled_truth);
                     if !page.timeline.trim().is_empty() {
-                        println!("\n---\n\n{}", page.timeline);
+                        println!("\n---\n\n{}", TimelineEntry::render_compat(&page.timeline));
                     }
                 }
                 Err(_) => {
@@ -499,7 +471,12 @@ async fn main() -> anyhow::Result<()> {
             engine.delete_page(&slug).await?;
             println!("Page deleted");
         }
-        Commands::List { r#type, tag, json, limit } => {
+        Commands::List {
+            r#type,
+            tag,
+            json,
+            limit,
+        } => {
             let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             let pages = engine.list_pages(r#type.as_deref(), tag.as_deref()).await?;
@@ -513,7 +490,11 @@ async fn main() -> anyhow::Result<()> {
                     println!("{} ({}) - {}", page.slug, page.page_type, page.title);
                 }
                 if total > limit {
-                    println!("  … and {} more (use -l {} to see all)", total - limit, total);
+                    println!(
+                        "  … and {} more (use -l {} to see all)",
+                        total - limit,
+                        total
+                    );
                 }
             }
         }
@@ -553,7 +534,13 @@ async fn main() -> anyhow::Result<()> {
                         if let Ok(page) = engine.get_page(slug).await {
                             match engine.chunk_and_embed_page(&page).await {
                                 Ok(_) => println!("  [{}/{}] {}", idx + 1, changed.len(), slug),
-                                Err(e) => eprintln!("  [{}/{}] {} — embed error: {}", idx + 1, changed.len(), slug, e),
+                                Err(e) => eprintln!(
+                                    "  [{}/{}] {} — embed error: {}",
+                                    idx + 1,
+                                    changed.len(),
+                                    slug,
+                                    e
+                                ),
                             }
                         }
                     }
@@ -572,7 +559,7 @@ async fn main() -> anyhow::Result<()> {
                     let pb = indicatif::ProgressBar::new(pages.len() as u64);
                     pb.set_style(
                         indicatif::ProgressStyle::with_template(
-                            "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}"
+                            "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}",
                         )
                         .unwrap()
                         .progress_chars("=>-"),
@@ -592,7 +579,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                     pb.finish_with_message(format!(
                         "done ({} ok, {} errors)",
-                        pages.len() - errors, errors
+                        pages.len() - errors,
+                        errors
                     ));
                 }
             } else if all {
@@ -600,7 +588,7 @@ async fn main() -> anyhow::Result<()> {
                 let pb = indicatif::ProgressBar::new(pages.len() as u64);
                 pb.set_style(
                     indicatif::ProgressStyle::with_template(
-                        "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}"
+                        "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}",
                     )
                     .unwrap()
                     .progress_chars("=>-"),
@@ -620,7 +608,8 @@ async fn main() -> anyhow::Result<()> {
                 }
                 pb.finish_with_message(format!(
                     "complete ({} ok, {} errors)",
-                    pages.len() - errors, errors
+                    pages.len() - errors,
+                    errors
                 ));
             } else if let Some(s) = slug {
                 let page = engine.get_page(&s).await?;
@@ -639,16 +628,16 @@ async fn main() -> anyhow::Result<()> {
 
             if all {
                 let pages = engine.list_pages(None, None).await?;
-                let mut total_links = 0usize;
                 for page in &pages {
                     let full_content = format!("{} {}", page.compiled_truth, page.timeline);
-                    let count = engine.reindex_page_links(&page.slug, &full_content).await?;
-                    if count > 0 {
-                        println!("{}: {} link(s) indexed", page.slug, count);
-                        total_links += count;
+                    let links = extract_links(&full_content);
+                    if !links.is_empty() {
+                        println!("{}:", page.slug);
+                        for link in links {
+                            println!("  -> {} ({})", link.target_slug, link.edge_type);
+                        }
                     }
                 }
-                println!("Done. {} link(s) re-indexed across {} page(s).", total_links, pages.len());
             } else if let Some(s) = slug {
                 let page = engine.get_page(&s).await?;
                 let full_content = format!("{} {}", page.compiled_truth, page.timeline);
@@ -664,23 +653,47 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("Either --all or a slug must be provided");
             }
         }
-        Commands::GraphQuery { slug, edge_type, r#type, depth, direction }
-        | Commands::Graph { slug, edge_type, r#type, depth, direction } => {
+        Commands::GraphQuery {
+            slug,
+            edge_type,
+            r#type,
+            depth,
+            direction,
+        }
+        | Commands::Graph {
+            slug,
+            edge_type,
+            r#type,
+            depth,
+            direction,
+        } => {
             let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             // --type is an alias for --edge-type
             let effective_edge_type = edge_type.or(r#type);
-            let edges = engine.graph_query(&slug, effective_edge_type.as_deref(), depth, &direction).await?;
-            println!("Graph query for '{}' (depth={}, direction={}):", slug, depth, direction);
+            let edges = engine
+                .graph_query(&slug, effective_edge_type.as_deref(), depth, &direction)
+                .await?;
+            println!(
+                "Graph query for '{}' (depth={}, direction={}):",
+                slug, depth, direction
+            );
             if let Some(ref et) = effective_edge_type {
                 println!("  Filtered by edge type: {}", et);
             }
             for edge in edges {
-                println!("  [{}] {} (depth={})", edge.edge_type, edge.target, edge.depth);
+                println!(
+                    "  [{}] {} (depth={})",
+                    edge.edge_type, edge.target, edge.depth
+                );
                 if let Some(ctx) = &edge.context {
                     let first = ctx.split("\n\n---\n\n").next().unwrap_or(ctx);
                     let preview: String = first.chars().take(160).collect();
-                    let preview = if first.chars().count() > 160 { format!("{}…", preview) } else { preview };
+                    let preview = if first.chars().count() > 160 {
+                        format!("{}…", preview)
+                    } else {
+                        preview
+                    };
                     println!("     Context: {}", preview);
                 }
             }
@@ -714,20 +727,34 @@ async fn main() -> anyhow::Result<()> {
                     let passages: Vec<&str> = ctx.split("\n\n---\n\n").collect();
                     if passages.len() == 1 {
                         let preview: String = ctx.chars().take(200).collect();
-                        let preview = if ctx.chars().count() > 200 { format!("{}…", preview) } else { preview };
+                        let preview = if ctx.chars().count() > 200 {
+                            format!("{}…", preview)
+                        } else {
+                            preview
+                        };
                         println!("     Context: {}", preview);
                     } else {
                         println!("     Context ({} passages):", passages.len());
                         for (i, p) in passages.iter().enumerate() {
                             let preview: String = p.chars().take(160).collect();
-                            let preview = if p.chars().count() > 160 { format!("{}…", preview) } else { preview.to_string() };
+                            let preview = if p.chars().count() > 160 {
+                                format!("{}…", preview)
+                            } else {
+                                preview.to_string()
+                            };
                             println!("       [{}] {}", i + 1, preview);
                         }
                     }
                 }
             }
         }
-        Commands::Link { from, to, r#type, from_chunk, context } => {
+        Commands::Link {
+            from,
+            to,
+            r#type,
+            from_chunk,
+            context,
+        } => {
             let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
 
@@ -746,16 +773,27 @@ async fn main() -> anyhow::Result<()> {
                         Some(format!("[chunk:{}] {}", chunk_id, text))
                     }
                     None => {
-                        anyhow::bail!("Chunk {} not found. Run `rbrain search` or `rbrain query` to see chunk IDs.", chunk_id);
+                        anyhow::bail!(
+                            "Chunk {} not found. Run `rbrain search` or `rbrain query` to see chunk IDs.",
+                            chunk_id
+                        );
                     }
                 }
             } else {
                 context
             };
 
-            engine.add_link(&from, &to, &r#type, resolved_context.as_deref(), from_chunk).await?;
+            engine
+                .add_link(&from, &to, &r#type, resolved_context.as_deref(), from_chunk)
+                .await?;
             if from_chunk.is_some() {
-                println!("Link added: {} --[{}]--> {} (context from chunk:{})", from, r#type, to, from_chunk.unwrap());
+                println!(
+                    "Link added: {} --[{}]--> {} (context from chunk:{})",
+                    from,
+                    r#type,
+                    to,
+                    from_chunk.unwrap()
+                );
             } else {
                 println!("Link added: {} --[{}]--> {}", from, r#type, to);
             }
@@ -783,72 +821,27 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Cite { slug, depth, format, append } => {
-            let config = load_config!();
-            let engine = Engine::open(config.clone()).await?;
-            let entries = engine.cite(&slug, depth).await?;
-            if entries.is_empty() {
-                println!("No original sources found reachable from '{}'.", slug);
-                println!("Tip: run `rbrain extract --all` to ensure wikilinks are indexed as graph links.");
-            } else {
-                // Build bibliography text
-                let bib = if format == "bibtex" {
-                    let mut s = String::new();
-                    for entry in &entries {
-                        let key = entry.slug.replace('/', "-").replace([' ', '_'], "-");
-                        s.push_str(&format!("@misc{{{},\n", key));
-                        s.push_str(&format!("  title = {{{}}},\n", entry.title));
-                        s.push_str(&format!("  note  = {{rbrain: {}}},\n", entry.slug));
-                        s.push_str("}\n\n");
-                    }
-                    s
-                } else {
-                    let mut s = String::new();
-                    for (i, entry) in entries.iter().enumerate() {
-                        s.push_str(&format!("[{}] {} — {}\n", i + 1, entry.title, entry.slug));
-                    }
-                    s
-                };
-
-                if append {
-                    let mut page = engine.get_page(&slug).await?;
-                    // Remove any existing 参考文献 section to avoid duplicates
-                    if let Some(pos) = page.compiled_truth.find("\n\n## 参考文献") {
-                        page.compiled_truth.truncate(pos);
-                    }
-                    page.compiled_truth.push_str("\n\n## 参考文献\n\n");
-                    page.compiled_truth.push_str(&bib);
-                    engine.put_page(page).await?;
-                    println!("Bibliography ({} source(s)) appended to '{}'.", entries.len(), slug);
-                } else if format == "bibtex" {
-                    print!("{}", bib);
-                } else {
-                    println!("参考文献\n");
-                    for (i, entry) in entries.iter().enumerate() {
-                        println!("[{}] {} — {}", i + 1, entry.title, entry.slug);
-                        if entry.path.len() > 1 {
-                            println!("    引用路径：{}", entry.path.join(" → "));
-                        }
-                        println!();
-                    }
-                }
-            }
-        }
-        Commands::Audit { slug, fix } => {
-            let config = load_config!();
-            let engine = Engine::open(config).await?;
-            let report = engine.audit_citations(&slug, fix).await?;
-            print!("{}", report.format_text());
-        }
-        Commands::Query { query, expand, limit, r#type, tag } => {
+        Commands::Query {
+            query,
+            expand,
+            limit,
+            r#type,
+            tag,
+        } => {
             let config = load_config!();
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
             let lang = rbrain_core::page::Language::detect(&query);
 
-            let chunks = engine.search_with_context_filtered(
-                &query, &lang, limit * 3, expand,
-                r#type.as_deref(), tag.as_deref(),
-            ).await?;
+            let chunks = engine
+                .search_with_context_filtered(
+                    &query,
+                    &lang,
+                    limit * 3,
+                    expand,
+                    r#type.as_deref(),
+                    tag.as_deref(),
+                )
+                .await?;
 
             if chunks.is_empty() {
                 println!("No results found for: {}", query);
@@ -856,86 +849,113 @@ async fn main() -> anyhow::Result<()> {
                 print_grouped_results(&query, &chunks, limit);
             }
         }
-        Commands::Search { query, limit, r#type, tag } => {
+        Commands::Search {
+            query,
+            limit,
+            r#type,
+            tag,
+        } => {
             let config = load_config!();
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
             let lang = rbrain_core::page::Language::detect(&query);
 
-            let ids = engine.keyword_search_filtered(
-                &query, &lang, limit * 3,
-                r#type.as_deref(), tag.as_deref(),
-            ).await?;
+            let ids = engine
+                .keyword_search_filtered(
+                    &query,
+                    &lang,
+                    limit * 3,
+                    r#type.as_deref(),
+                    tag.as_deref(),
+                )
+                .await?;
             if ids.is_empty() {
                 println!("No results found for: {}", query);
             } else {
                 let chunk_ids: Vec<i64> = ids.iter().map(|(id, _)| *id).collect();
                 let texts = engine.fetch_chunks_text(&chunk_ids).await?;
-                let text_map: std::collections::HashMap<i64, (String, String, String)> =
-                    texts.into_iter().map(|(id, text, slug, page_type)| (id, (text, slug, page_type))).collect();
+                let text_map: std::collections::HashMap<i64, (String, String)> = texts
+                    .into_iter()
+                    .map(|(id, text, slug)| (id, (text, slug)))
+                    .collect();
 
                 let chunks: Vec<rbrain_engine::ChunkResult> = ids
                     .into_iter()
                     .filter_map(|(chunk_id, score)| {
-                        text_map.get(&chunk_id).map(|(text, slug, page_type)| rbrain_engine::ChunkResult {
-                            chunk_id,
-                            score: score as f64,
-                            text: text.clone(),
-                            page_slug: slug.clone(),
-                            page_type: page_type.clone(),
-                        })
+                        text_map
+                            .get(&chunk_id)
+                            .map(|(text, slug)| rbrain_engine::ChunkResult {
+                                chunk_id,
+                                score: score as f64,
+                                text: text.clone(),
+                                page_slug: slug.clone(),
+                            })
                     })
                     .collect();
 
                 print_grouped_results(&query, &chunks, limit);
             }
         }
-        Commands::Generate { topic, limit, save, draft, expand } => {
+        Commands::Generate {
+            topic,
+            limit,
+            save,
+            expand,
+        } => {
             let config = load_config!();
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
             let lang = rbrain_core::page::Language::detect(&topic);
 
             eprintln!("Searching for: {}…", topic);
-            let wiki = engine.generate_wiki(&topic, &lang, limit, expand).await
+            let wiki = engine
+                .generate_wiki(&topic, &lang, limit, expand)
+                .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
             println!("{}", wiki);
 
             if save {
-                let base = topic.to_lowercase().replace(' ', "-").replace(['/', '\\', '.'], "-");
-                let (slug, page_type, label) = if draft {
-                    (format!("research/drafts/{}", base), "draft", "draft")
-                } else {
-                    (format!("research/wiki/{}", base), "wiki", "wiki")
-                };
-                let title = wiki.lines()
-                    .find(|l| l.starts_with("# "))
-                    .map(|l| l.trim_start_matches("# ").to_string())
-                    .unwrap_or_else(|| topic.clone());
-                let detected_lang = rbrain_core::page::Language::detect(&wiki);
-                let mut page = Page::new(slug.clone(), page_type.to_string(), wiki);
-                page.title = title;
-                page.language = Some(detected_lang);
+                let slug = topic
+                    .to_lowercase()
+                    .replace(' ', "-")
+                    .replace(['/', '\\', '.'], "-");
+                let page = Page::new(slug.clone(), "wiki".to_string(), wiki);
                 engine.put_page(page.clone()).await?;
-                eprintln!("\nSaved as {} page: {}", label, slug);
+                eprintln!("\nSaved as wiki page: {}", slug);
                 if engine.has_embedder() {
                     eprint!("Embedding… ");
                     match engine.chunk_and_embed_page(&page).await {
                         Ok(_) => eprintln!("done."),
-                        Err(e) => eprintln!("warning: embed failed ({}). Run `rbrain embed {}` manually.", e, slug),
+                        Err(e) => eprintln!(
+                            "warning: embed failed ({}). Run `rbrain embed {}` manually.",
+                            e, slug
+                        ),
                     }
                 }
             }
         }
-        Commands::Timeline { slug, date, text, source } => {
+        Commands::Timeline {
+            slug,
+            date,
+            text,
+            source,
+        } => {
             let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
-            let date_str = date.unwrap_or_else(|| {
-                chrono::Utc::now().format("%Y-%m-%d").to_string()
-            });
-            engine.add_timeline_entry(&slug, &date_str, &text, source.as_deref()).await?;
-            println!("Timeline entry added to '{}': {} — {}", slug, date_str, text);
+            let date_str =
+                date.unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+            engine
+                .add_timeline_entry(&slug, &date_str, &text, source.as_deref())
+                .await?;
+            println!(
+                "Timeline entry added to '{}': {} — {}",
+                slug, date_str, text
+            );
         }
-        Commands::Take { slug, content, kind } => {
+        Commands::Take {
+            slug,
+            content,
+            kind,
+        } => {
             let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             engine.add_take(&slug, &content, &kind).await?;
@@ -945,10 +965,7 @@ async fn main() -> anyhow::Result<()> {
             let config = load_config!();
             let engine = Engine::open(config.clone()).await?;
             let page = engine.get_page(&slug).await?;
-            let takes: Vec<&str> = page.timeline
-                .lines()
-                .filter(|l| l.contains("[take/"))
-                .collect();
+            let takes = TimelineEntry::take_lines_compat(&page.timeline);
             if takes.is_empty() {
                 println!("No takes recorded for '{}'.", slug);
             } else {
@@ -958,35 +975,43 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Think { topic, limit, save, draft, expand } => {
+        Commands::Think {
+            topic,
+            limit,
+            save,
+            expand,
+        } => {
             let config = load_config!();
             let engine = init_engine_with_search(config.clone(), mock_embed).await?;
             let lang = rbrain_core::page::Language::detect(&topic);
 
             eprintln!("Thinking about: {}…", topic);
-            let reasoning = engine.think(&topic, &lang, limit, expand).await
+            let reasoning = engine
+                .think(&topic, &lang, limit, expand)
+                .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
             println!("{}", reasoning);
 
             if save {
-                let base = topic.to_lowercase().replace(' ', "-").replace(['/', '\\', '.'], "-");
-                let (slug, page_type, label) = if draft {
-                    (format!("research/drafts/{}", base), "draft", "draft")
-                } else {
-                    (format!("research/synthesis/{}", base), "synthesis", "synthesis")
-                };
-                let detected_lang = rbrain_core::page::Language::detect(&reasoning);
-                let mut page = Page::new(slug.clone(), page_type.to_string(), reasoning);
-                page.title = topic.clone();
-                page.language = Some(detected_lang);
+                let slug = format!(
+                    "synthesis/{}",
+                    topic
+                        .to_lowercase()
+                        .replace(' ', "-")
+                        .replace(['/', '\\', '.'], "-")
+                );
+                let page = Page::new(slug.clone(), "synthesis".to_string(), reasoning);
                 engine.put_page(page.clone()).await?;
-                eprintln!("\nSaved as {} page: {}", label, slug);
+                eprintln!("\nSaved as synthesis page: {}", slug);
                 if engine.has_embedder() {
                     eprint!("Embedding… ");
                     match engine.chunk_and_embed_page(&page).await {
                         Ok(_) => eprintln!("done."),
-                        Err(e) => eprintln!("warning: embed failed ({}). Run `rbrain embed {}` manually.", e, slug),
+                        Err(e) => eprintln!(
+                            "warning: embed failed ({}). Run `rbrain embed {}` manually.",
+                            e, slug
+                        ),
                     }
                 }
             }
@@ -1031,7 +1056,8 @@ async fn main() -> anyhow::Result<()> {
             if warnings.is_empty() {
                 println!("No issues found — brain looks clean.");
             } else {
-                let (warns, infos): (Vec<_>, Vec<_>) = warnings.iter().partition(|(lvl, _, _)| lvl == "WARN");
+                let (warns, infos): (Vec<_>, Vec<_>) =
+                    warnings.iter().partition(|(lvl, _, _)| lvl == "WARN");
                 for (lvl, slug, msg) in &warnings {
                     println!("{} {}: {}", lvl, slug, msg);
                 }
@@ -1064,23 +1090,38 @@ async fn main() -> anyhow::Result<()> {
 
             // Embedding coverage
             println!("\n── Embedding Coverage ─────────────────────────────────");
-            println!("  Overall: {:.1}%  ({} / {} chunks)",
+            println!(
+                "  Overall: {:.1}%  ({} / {} chunks)",
                 stats.embedding_coverage,
                 (stats.total_chunks as f64 * stats.embedding_coverage / 100.0) as i64,
-                stats.total_chunks);
+                stats.total_chunks
+            );
             for (t, emb, total) in &coverage_by_type {
-                let pct = if *total > 0 { (*emb as f64 / *total as f64) * 100.0 } else { 100.0 };
+                let pct = if *total > 0 {
+                    (*emb as f64 / *total as f64) * 100.0
+                } else {
+                    100.0
+                };
                 let bar_len = (pct / 5.0) as usize; // 20-char bar
                 let bar = format!("{}{}", "█".repeat(bar_len), "░".repeat(20 - bar_len));
-                println!("  {:12} [{bar}] {:.0}%  ({emb}/{total} chunks)",
-                    t, pct, emb = emb, total = total);
+                println!(
+                    "  {:12} [{bar}] {:.0}%  ({emb}/{total} chunks)",
+                    t,
+                    pct,
+                    emb = emb,
+                    total = total
+                );
             }
 
             // Graph
             println!("\n── Graph ──────────────────────────────────────────────");
             let link_count = engine.link_count().await?;
-            println!("  Links: {}   Orphans: {}   Density: {:.2} edges/page",
-                link_count, orphans.len(), stats.graph_density);
+            println!(
+                "  Links: {}   Orphans: {}   Density: {:.2} edges/page",
+                link_count,
+                orphans.len(),
+                stats.graph_density
+            );
             println!("  Top-linked pages:");
             for (slug, deg) in &top_linked {
                 println!("    {:3} ← {}", deg, slug);
@@ -1088,8 +1129,12 @@ async fn main() -> anyhow::Result<()> {
 
             // Storage
             println!("\n── Storage ────────────────────────────────────────────");
-            let db_size = std::fs::metadata(&config.db_path).map(|m| m.len()).unwrap_or(0);
-            let vec_size = std::fs::metadata(&config.vectors_path).map(|m| m.len()).unwrap_or(0);
+            let db_size = std::fs::metadata(&config.db_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let vec_size = std::fs::metadata(&config.vectors_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
             let tantivy_size: u64 = walkdir::WalkDir::new(&config.tantivy_dir)
                 .into_iter()
                 .filter_map(|e| e.ok())
@@ -1110,14 +1155,21 @@ async fn main() -> anyhow::Result<()> {
                     println!("  ✗ {}", issue);
                 }
                 if !orphans.is_empty() {
-                    println!("  ✗ {} orphan pages (no incoming links) — run `rbrain orphans`", orphans.len());
+                    println!(
+                        "  ✗ {} orphan pages (no incoming links) — run `rbrain orphans`",
+                        orphans.len()
+                    );
                 }
                 if fix {
                     let fixed_chunks = engine.fix_stale_chunks().await?;
-                    if fixed_chunks > 0 { println!("  → Queued {} pages for re-embedding", fixed_chunks); }
+                    if fixed_chunks > 0 {
+                        println!("  → Queued {} pages for re-embedding", fixed_chunks);
+                    }
                     println!("  Repairs complete.");
                 } else {
-                    println!("\nTip: run `rbrain doctor --fix` to auto-repair, or `rbrain embed --stale`.");
+                    println!(
+                        "\nTip: run `rbrain doctor --fix` to auto-repair, or `rbrain embed --stale`."
+                    );
                 }
             }
             println!("═══════════════════════════════════════════════════════");
@@ -1162,12 +1214,26 @@ async fn main() -> anyhow::Result<()> {
                     println!("\n[qwen]");
                     println!("  base_url:       {}", config.qwen.base_url);
                     println!("  model:          {}", config.qwen.model);
-                    let qwen_key = if config.qwen.api_key.is_empty() { "(not set)".to_string() } else { format!("{}…", &config.qwen.api_key[..config.qwen.api_key.len().min(8)]) };
+                    let qwen_key = if config.qwen.api_key.is_empty() {
+                        "(not set)".to_string()
+                    } else {
+                        format!(
+                            "{}…",
+                            &config.qwen.api_key[..config.qwen.api_key.len().min(8)]
+                        )
+                    };
                     println!("  api_key:        {}", qwen_key);
                     println!("\n[deepseek]");
                     println!("  base_url:       {}", config.deepseek.base_url);
                     println!("  model:          {}", config.deepseek.model);
-                    let ds_key = if config.deepseek.api_key.is_empty() { "(not set)".to_string() } else { format!("{}…", &config.deepseek.api_key[..config.deepseek.api_key.len().min(8)]) };
+                    let ds_key = if config.deepseek.api_key.is_empty() {
+                        "(not set)".to_string()
+                    } else {
+                        format!(
+                            "{}…",
+                            &config.deepseek.api_key[..config.deepseek.api_key.len().min(8)]
+                        )
+                    };
                     println!("  api_key:        {}", ds_key);
                 }
                 ConfigAction::Get { key } => {
@@ -1183,10 +1249,15 @@ async fn main() -> anyhow::Result<()> {
                         "qwen.model" => config.qwen.model.clone(),
                         "qwen.api_key" => "(redacted)".to_string(),
                         "deepseek.base_url" => config.deepseek.base_url.clone(),
-                        "deepseek.model" | "models.think" | "models.default" => config.deepseek.model.clone(),
+                        "deepseek.model" | "models.think" | "models.default" => {
+                            config.deepseek.model.clone()
+                        }
                         "deepseek.api_key" => "(redacted)".to_string(),
                         other => {
-                            eprintln!("Unknown config key: {}. Try `rbrain config show` to see available keys.", other);
+                            eprintln!(
+                                "Unknown config key: {}. Try `rbrain config show` to see available keys.",
+                                other
+                            );
                             std::process::exit(1);
                         }
                     };
@@ -1209,8 +1280,14 @@ async fn main() -> anyhow::Result<()> {
                         rbrain_mcp::run_stdio_server(engine).await?;
                     }
                 }
-                ServeAction::Supervisor { concurrency, interval_secs } => {
-                    println!("Starting supervisor with concurrency={} interval={}s", concurrency, interval_secs);
+                ServeAction::Supervisor {
+                    concurrency,
+                    interval_secs,
+                } => {
+                    println!(
+                        "Starting supervisor with concurrency={} interval={}s",
+                        concurrency, interval_secs
+                    );
                     println!("Press Ctrl+C to stop");
 
                     let engine = Engine::open(config.clone()).await?;
@@ -1218,9 +1295,15 @@ async fn main() -> anyhow::Result<()> {
                     let queue = Arc::new(rbrain_worker::JobQueue::new(db));
 
                     let mut worker = rbrain_worker::Worker::new(queue, concurrency);
-                    worker.register_handler(Arc::new(rbrain_worker::EmbedPageHandler::new(engine.clone())));
-                    worker.register_handler(Arc::new(rbrain_worker::SyncRepoHandler::new(engine.clone())));
-                    worker.register_handler(Arc::new(rbrain_worker::ExtractLinksHandler::new(engine.clone())));
+                    worker.register_handler(Arc::new(rbrain_worker::EmbedPageHandler::new(
+                        engine.clone(),
+                    )));
+                    worker.register_handler(Arc::new(rbrain_worker::SyncRepoHandler::new(
+                        engine.clone(),
+                    )));
+                    worker.register_handler(Arc::new(rbrain_worker::ExtractLinksHandler::new(
+                        engine.clone(),
+                    )));
 
                     let (tx, rx) = tokio::sync::watch::channel(false);
 
@@ -1246,33 +1329,54 @@ async fn main() -> anyhow::Result<()> {
             let queue = Arc::new(rbrain_worker::JobQueue::new(db));
 
             match action {
-                JobsAction::Submit { name, params, queue: queue_name, priority } => {
+                JobsAction::Submit {
+                    name,
+                    params,
+                    queue: queue_name,
+                    priority,
+                } => {
                     let params_json: serde_json::Value = serde_json::from_str(&params)
                         .map_err(|e| anyhow::anyhow!("Invalid JSON params: {}", e))?;
 
-                    let job_id = queue.submit_job(
-                        &name,
-                        &params_json,
-                        queue_name.as_deref(),
-                        priority,
-                        None,
-                        None,
-                    ).await?;
+                    let job_id = queue
+                        .submit_job(
+                            &name,
+                            &params_json,
+                            queue_name.as_deref(),
+                            priority,
+                            None,
+                            None,
+                        )
+                        .await?;
 
                     println!("Job submitted: id={}", job_id);
                 }
                 JobsAction::List { status, limit } => {
-                    let status_filter = status.map(|s| s.parse::<rbrain_worker::JobStatus>().map_err(|e| anyhow::anyhow!("{}", e))).transpose()?;
+                    let status_filter = status
+                        .map(|s| {
+                            s.parse::<rbrain_worker::JobStatus>()
+                                .map_err(|e| anyhow::anyhow!("{}", e))
+                        })
+                        .transpose()?;
                     let jobs = queue.list_jobs(status_filter, limit).await?;
 
-                    println!("{:<6} {:<12} {:<20} {:<10} {:<8} {:<20}",
-                        "ID", "Status", "Name", "Attempts", "Priority", "Created");
+                    println!(
+                        "{:<6} {:<12} {:<20} {:<10} {:<8} {:<20}",
+                        "ID", "Status", "Name", "Attempts", "Priority", "Created"
+                    );
                     println!("{}", "-".repeat(80));
 
                     for job in jobs {
                         let created = job.created_at.format("%Y-%m-%d %H:%M:%S");
-                        println!("{:<6} {:<12} {:<20} {:<10} {:<8} {}",
-                            job.id, job.status.to_string(), job.name, job.attempts, job.priority, created);
+                        println!(
+                            "{:<6} {:<12} {:<20} {:<10} {:<8} {}",
+                            job.id,
+                            job.status.to_string(),
+                            job.name,
+                            job.attempts,
+                            job.priority,
+                            created
+                        );
                     }
                 }
                 JobsAction::Get { id } => {
@@ -1312,9 +1416,15 @@ async fn main() -> anyhow::Result<()> {
                     let engine = Engine::open(config.clone()).await?;
                     let mut worker = rbrain_worker::Worker::new(queue, concurrency);
 
-                    worker.register_handler(Arc::new(rbrain_worker::EmbedPageHandler::new(engine.clone())));
-                    worker.register_handler(Arc::new(rbrain_worker::SyncRepoHandler::new(engine.clone())));
-                    worker.register_handler(Arc::new(rbrain_worker::ExtractLinksHandler::new(engine.clone())));
+                    worker.register_handler(Arc::new(rbrain_worker::EmbedPageHandler::new(
+                        engine.clone(),
+                    )));
+                    worker.register_handler(Arc::new(rbrain_worker::SyncRepoHandler::new(
+                        engine.clone(),
+                    )));
+                    worker.register_handler(Arc::new(rbrain_worker::ExtractLinksHandler::new(
+                        engine.clone(),
+                    )));
 
                     tokio::select! {
                         result = worker.run(rx) => {
@@ -1338,8 +1448,10 @@ async fn main() -> anyhow::Result<()> {
                     println!("  Done:      {}", stats.done);
                     println!("  Failed:    {}", stats.failed);
                     println!("  Cancelled: {}", stats.cancelled);
-                    println!("  Total:     {}",
-                        stats.pending + stats.running + stats.done + stats.failed + stats.cancelled);
+                    println!(
+                        "  Total:     {}",
+                        stats.pending + stats.running + stats.done + stats.failed + stats.cancelled
+                    );
                 }
             }
         }
@@ -1362,7 +1474,9 @@ fn print_grouped_results(query: &str, chunks: &[rbrain_engine::ChunkResult], pag
     for chunk in chunks {
         if let Some(&idx) = seen.get(chunk.page_slug.as_str()) {
             let entry = &mut pages[idx];
-            if chunk.score > entry.1 { entry.1 = chunk.score; }
+            if chunk.score > entry.1 {
+                entry.1 = chunk.score;
+            }
             entry.2.push(chunk);
         } else {
             seen.insert(&chunk.page_slug, pages.len());
@@ -1375,13 +1489,20 @@ fn print_grouped_results(query: &str, chunks: &[rbrain_engine::ChunkResult], pag
 
     let total_pages = pages.len();
     let total_chunks: usize = pages.iter().map(|(_, _, ch)| ch.len()).sum();
-    println!("Found {} page(s) / {} chunk(s) for: {}\n", total_pages, total_chunks, query);
+    println!(
+        "Found {} page(s) / {} chunk(s) for: {}\n",
+        total_pages, total_chunks, query
+    );
 
     for (rank, (slug, best_score, page_chunks)) in pages.iter().enumerate() {
         let n = page_chunks.len();
         println!(
             "[{}] {} — {} chunk{} (best score={:.4})",
-            rank + 1, slug, n, if n == 1 { "" } else { "s" }, best_score
+            rank + 1,
+            slug,
+            n,
+            if n == 1 { "" } else { "s" },
+            best_score
         );
         // Show up to 2 chunk previews per page with chunk_id for evidence linking
         for chunk in page_chunks.iter().take(2) {
@@ -1394,7 +1515,10 @@ fn print_grouped_results(query: &str, chunks: &[rbrain_engine::ChunkResult], pag
             println!("    ↳ [chunk:{}] {}", chunk.chunk_id, preview);
         }
         if n > 2 {
-            println!("    ↳ … ({} more chunks, use --show-chunks to list all)", n - 2);
+            println!(
+                "    ↳ … ({} more chunks, use --show-chunks to list all)",
+                n - 2
+            );
         }
         println!();
     }
@@ -1419,16 +1543,23 @@ fn update_gitignore(project_dir: &std::path::Path) -> anyhow::Result<()> {
 }
 
 fn fmt_bytes(n: u64) -> String {
-    if n < 1024 { format!("{} B", n) }
-    else if n < 1024 * 1024 { format!("{:.1} KB", n as f64 / 1024.0) }
-    else if n < 1024 * 1024 * 1024 { format!("{:.1} MB", n as f64 / 1024.0 / 1024.0) }
-    else { format!("{:.2} GB", n as f64 / 1024.0 / 1024.0 / 1024.0) }
+    if n < 1024 {
+        format!("{} B", n)
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else if n < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", n as f64 / 1024.0 / 1024.0)
+    } else {
+        format!("{:.2} GB", n as f64 / 1024.0 / 1024.0 / 1024.0)
+    }
 }
-
 
 async fn init_engine_with_search(config: Config, mock_embed: bool) -> anyhow::Result<Engine> {
     let keyword_index = Arc::new(TantivyIndex::new(config.tantivy_dir.clone())?);
-    let vector_store = Arc::new(UsearchStore::new(config.vectors_path.clone(), config.embedding_dim)?);
+    let vector_store = Arc::new(UsearchStore::new(
+        config.vectors_path.clone(),
+        config.embedding_dim,
+    )?);
 
     let embedder: Arc<dyn Embedder> = if mock_embed {
         Arc::new(MockEmbedder::new(config.embedding_dim))
@@ -1436,7 +1567,10 @@ async fn init_engine_with_search(config: Config, mock_embed: bool) -> anyhow::Re
         match QwenEmbedder::from_config(&config.qwen) {
             Ok(e) => Arc::new(e),
             Err(e) => {
-                eprintln!("Warning: failed to init Qwen embedder ({}). Run with --mock-embed for offline testing.", e);
+                eprintln!(
+                    "Warning: failed to init Qwen embedder ({}). Run with --mock-embed for offline testing.",
+                    e
+                );
                 return Ok(Engine::open(config).await?);
             }
         }
@@ -1444,4 +1578,3 @@ async fn init_engine_with_search(config: Config, mock_embed: bool) -> anyhow::Re
 
     Ok(Engine::open_with_search(config, embedder, vector_store, keyword_index).await?)
 }
-

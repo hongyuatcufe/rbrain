@@ -1,10 +1,11 @@
+use rbrain_core::page::Page;
+use rbrain_core::schema::TimelineEntry;
+use rbrain_engine::Engine;
 use rmcp::{
     handler::server::wrapper::{Json, Parameters},
     schemars::{self, JsonSchema},
     tool, tool_router,
 };
-use rbrain_core::page::Page;
-use rbrain_engine::Engine;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -17,7 +18,6 @@ impl RBrainMcpServer {
         Self { engine }
     }
 }
-
 
 // ── Argument types ─────────────────────────────────────────────────────────
 
@@ -137,6 +137,99 @@ pub struct OutlinksArgs {
     pub slug: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct ResearchRunArgs {
+    /// Stable research run id, e.g. "brief-2026-06"
+    pub run_id: String,
+    /// Human-readable title
+    pub title: String,
+    /// Optional research question
+    pub question: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ResearchProtocolArgs {
+    /// Research run slug, e.g. "research/runs/brief-2026-06"
+    pub run_slug: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RecordArtifactArgs {
+    /// Research run slug, e.g. "research/runs/brief-2026-06"
+    pub run_slug: String,
+    /// Artifact page slug, e.g. "artifacts/brief-2026-06"
+    pub slug: String,
+    pub title: String,
+    pub artifact_kind: String,
+    pub path: String,
+    pub description: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RegisterInputArgs {
+    /// Research run slug, e.g. "research/runs/brief-2026-06"
+    pub run_slug: String,
+    /// Input page slug, e.g. "datasets/citations-2026-06"
+    pub slug: String,
+    pub title: String,
+    /// Input page type: dataset, literature_corpus, citation_record, source, method_note, research_memo
+    pub input_type: String,
+    pub content: String,
+    /// Optional structured metadata merged into frontmatter
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RecordFindingArgs {
+    /// Research run slug, e.g. "research/runs/brief-2026-06"
+    pub run_slug: String,
+    /// Finding page slug, e.g. "findings/topic-shift"
+    pub slug: String,
+    pub title: String,
+    pub status: String,
+    pub content: String,
+    /// Evidence/artifact/source slugs supporting this finding
+    pub supporting_slugs: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RecordValidationReportArgs {
+    /// Research run slug, e.g. "research/runs/brief-2026-06"
+    pub run_slug: String,
+    /// Validation report page slug
+    pub slug: String,
+    pub title: String,
+    pub validator: String,
+    pub status: String,
+    pub content: String,
+    /// Pages validated by this report
+    pub validates_slugs: Option<Vec<String>>,
+    /// Optional structured suggested actions
+    pub suggested_actions: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RecordActionItemArgs {
+    /// Research run slug, e.g. "research/runs/brief-2026-06"
+    pub run_slug: String,
+    /// Action item page slug
+    pub slug: String,
+    pub title: String,
+    pub action_kind: String,
+    pub status: String,
+    pub content: String,
+    /// Pages this action item recommends follow-up for
+    pub target_slugs: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ProvenanceArgs {
+    /// Root page slug to inspect
+    pub slug: String,
+    /// Traversal depth, 1-5, default 2
+    pub depth: Option<i32>,
+}
+
 // ── Result types ────────────────────────────────────────────────────────────
 
 #[derive(Serialize, JsonSchema)]
@@ -228,6 +321,28 @@ pub struct LinkList {
     pub results: Vec<LinkRef>,
 }
 
+#[derive(Serialize, JsonSchema)]
+pub struct ProvenanceNode {
+    pub slug: String,
+    pub page_type: String,
+    pub title: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ProvenanceEdge {
+    pub source_slug: String,
+    pub target_slug: String,
+    pub edge_type: String,
+    pub context: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ProvenanceResult {
+    pub root_slug: String,
+    pub nodes: Vec<ProvenanceNode>,
+    pub edges: Vec<ProvenanceEdge>,
+}
+
 /// Wrapper for Vec<String> (orphan slugs)
 #[derive(Serialize, JsonSchema)]
 pub struct SlugList {
@@ -264,9 +379,29 @@ pub struct MutationResult {
     pub message: String,
 }
 
+#[derive(Serialize, JsonSchema)]
+pub struct ResearchProtocolResult {
+    pub protocol: serde_json::Value,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ValidationRunResult {
+    pub results: serde_json::Value,
+}
+
 impl MutationResult {
-    fn ok(msg: impl Into<String>) -> Self { Self { ok: true, message: msg.into() } }
-    fn err(msg: impl Into<String>) -> Self { Self { ok: false, message: msg.into() } }
+    fn ok(msg: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            message: msg.into(),
+        }
+    }
+    fn err(msg: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            message: msg.into(),
+        }
+    }
 }
 
 // ── MCP Tools ───────────────────────────────────────────────────────────────
@@ -285,7 +420,11 @@ impl RBrainMcpServer {
         let expand = args.expand.unwrap_or(false);
         let lang = rbrain_core::page::Language::detect(&args.query);
 
-        match self.engine.search_with_context(&args.query, &lang, limit, expand).await {
+        match self
+            .engine
+            .search_with_context(&args.query, &lang, limit, expand)
+            .await
+        {
             Ok(chunks) => Json(ChunkList {
                 results: chunks
                     .into_iter()
@@ -320,11 +459,14 @@ impl RBrainMcpServer {
                     tags: page.tags,
                     language: page.language.as_ref().map(|l| l.to_string()),
                     compiled_truth: page.compiled_truth,
-                    timeline: page.timeline,
+                    timeline: TimelineEntry::render_compat(&page.timeline),
                     updated_at: page.updated_at.to_string(),
                 }),
             }),
-            Err(_) => Json(GetResult { found: false, page: None }),
+            Err(_) => Json(GetResult {
+                found: false,
+                page: None,
+            }),
         }
     }
 
@@ -448,11 +590,7 @@ impl RBrainMcpServer {
                 total_chunks: s.total_chunks,
                 embedding_coverage_pct: s.embedding_coverage,
                 graph_density: s.graph_density,
-                pages_by_type: s
-                    .pages_by_type
-                    .into_iter()
-                    .map(|(k, v)| (k, v))
-                    .collect(),
+                pages_by_type: s.pages_by_type.into_iter().map(|(k, v)| (k, v)).collect(),
                 pages_by_language: s
                     .pages_by_language
                     .into_iter()
@@ -483,7 +621,11 @@ impl RBrainMcpServer {
         let expand = args.expand.unwrap_or(false);
         let lang = rbrain_core::page::Language::detect(&args.topic);
 
-        match self.engine.generate_wiki(&args.topic, &lang, limit, expand).await {
+        match self
+            .engine
+            .generate_wiki(&args.topic, &lang, limit, expand)
+            .await
+        {
             Ok(wiki) => {
                 let saved_as = if args.save.unwrap_or(false) {
                     let slug = args
@@ -502,7 +644,10 @@ impl RBrainMcpServer {
                 } else {
                     None
                 };
-                Json(GenerateResult { content: wiki, saved_as })
+                Json(GenerateResult {
+                    content: wiki,
+                    saved_as,
+                })
             }
             Err(e) => {
                 tracing::error!("brain_generate error: {}", e);
@@ -531,7 +676,8 @@ impl RBrainMcpServer {
                 Ok(Some((text, _page_slug))) => Some(text),
                 Ok(None) => {
                     return Json(MutationResult::err(format!(
-                        "Chunk {} not found. Use chunk_id from brain_query results.", chunk_id
+                        "Chunk {} not found. Use chunk_id from brain_query results.",
+                        chunk_id
                     )));
                 }
                 Err(e) => {
@@ -542,11 +688,27 @@ impl RBrainMcpServer {
             args.context.clone()
         };
 
-        match self.engine.add_link(&args.from, &args.to, link_type, context.as_deref(), args.chunk_id).await {
+        match self
+            .engine
+            .add_link(
+                &args.from,
+                &args.to,
+                link_type,
+                context.as_deref(),
+                args.chunk_id,
+            )
+            .await
+        {
             Ok(_) => Json(MutationResult::ok(format!(
                 "Link added: {} --[{}]--> {}{}",
-                args.from, link_type, args.to,
-                if args.chunk_id.is_some() { format!(" (context from chunk:{})", args.chunk_id.unwrap()) } else { String::new() }
+                args.from,
+                link_type,
+                args.to,
+                if args.chunk_id.is_some() {
+                    format!(" (context from chunk:{})", args.chunk_id.unwrap())
+                } else {
+                    String::new()
+                }
             ))),
             Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
         }
@@ -559,9 +721,19 @@ impl RBrainMcpServer {
             Specify link_type to remove only that type; omit to remove all links between these pages."
     )]
     async fn unlink(&self, Parameters(args): Parameters<UnlinkArgs>) -> Json<MutationResult> {
-        match self.engine.remove_link(&args.from, &args.to, args.link_type.as_deref()).await {
-            Ok(n) if n > 0 => Json(MutationResult::ok(format!("Removed {} link(s): {} --> {}", n, args.from, args.to))),
-            Ok(_) => Json(MutationResult::err(format!("No matching link found: {} --> {}", args.from, args.to))),
+        match self
+            .engine
+            .remove_link(&args.from, &args.to, args.link_type.as_deref())
+            .await
+        {
+            Ok(n) if n > 0 => Json(MutationResult::ok(format!(
+                "Removed {} link(s): {} --> {}",
+                n, args.from, args.to
+            ))),
+            Ok(_) => Json(MutationResult::err(format!(
+                "No matching link found: {} --> {}",
+                args.from, args.to
+            ))),
             Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
         }
     }
@@ -592,7 +764,263 @@ impl RBrainMcpServer {
         let expand = args.expand.unwrap_or(false);
         match self.engine.think(&args.topic, &lang, limit, expand).await {
             Ok(result) => Json(ThinkResult { reasoning: result }),
-            Err(e) => Json(ThinkResult { reasoning: format!("Error: {}", e) }),
+            Err(e) => Json(ThinkResult {
+                reasoning: format!("Error: {}", e),
+            }),
+        }
+    }
+
+    /// Create a structured research run ledger page.
+    #[tool(
+        name = "brain_create_research_run",
+        description = "Create a structured research_run page for recording an academic workflow. \
+            The page is schema-checked and can produce artifacts/findings through provenance edges."
+    )]
+    async fn create_research_run(
+        &self,
+        Parameters(args): Parameters<ResearchRunArgs>,
+    ) -> Json<MutationResult> {
+        match self
+            .engine
+            .create_research_run(&args.run_id, &args.title, args.question.as_deref())
+            .await
+        {
+            Ok(page) => Json(MutationResult::ok(format!(
+                "Research run created: {}",
+                page.slug
+            ))),
+            Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
+        }
+    }
+
+    /// Return a grouped protocol view for a research run.
+    #[tool(
+        name = "brain_get_research_protocol",
+        description = "Return a grouped research_run protocol: inputs, artifacts, findings, validation reports, action items, and relation edges."
+    )]
+    async fn get_research_protocol(
+        &self,
+        Parameters(args): Parameters<ResearchProtocolArgs>,
+    ) -> Json<ResearchProtocolResult> {
+        match self.engine.get_research_protocol(&args.run_slug).await {
+            Ok(protocol) => Json(ResearchProtocolResult {
+                protocol: serde_json::to_value(protocol).unwrap_or_else(|_| serde_json::json!({})),
+            }),
+            Err(e) => Json(ResearchProtocolResult {
+                protocol: serde_json::json!({ "error": e.to_string() }),
+            }),
+        }
+    }
+
+    /// Run built-in validators for a research run and persist validation reports/action items.
+    #[tool(
+        name = "brain_validate_research_run",
+        description = "Run built-in validators for a research_run, then write validation_report and action_item pages back to rbrain."
+    )]
+    async fn validate_research_run(
+        &self,
+        Parameters(args): Parameters<ResearchProtocolArgs>,
+    ) -> Json<ValidationRunResult> {
+        match self.engine.validate_research_run(&args.run_slug).await {
+            Ok(results) => Json(ValidationRunResult {
+                results: serde_json::to_value(results).unwrap_or_else(|_| serde_json::json!([])),
+            }),
+            Err(e) => Json(ValidationRunResult {
+                results: serde_json::json!({ "error": e.to_string() }),
+            }),
+        }
+    }
+
+    /// Record an artifact produced by a research run.
+    #[tool(
+        name = "brain_record_artifact",
+        description = "Create an artifact page and link the research run to it with a produces edge."
+    )]
+    async fn record_artifact(
+        &self,
+        Parameters(args): Parameters<RecordArtifactArgs>,
+    ) -> Json<MutationResult> {
+        match self
+            .engine
+            .record_artifact(
+                &args.run_slug,
+                &args.slug,
+                &args.title,
+                &args.artifact_kind,
+                &args.path,
+                &args.description,
+            )
+            .await
+        {
+            Ok(page) => Json(MutationResult::ok(format!(
+                "Artifact recorded: {}",
+                page.slug
+            ))),
+            Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
+        }
+    }
+
+    /// Register a dataset, corpus, citation record, source, method note, or memo used by a research run.
+    #[tool(
+        name = "brain_register_input",
+        description = "Create an input page used by a research run and link it with an appropriate provenance edge."
+    )]
+    async fn register_input(
+        &self,
+        Parameters(args): Parameters<RegisterInputArgs>,
+    ) -> Json<MutationResult> {
+        match self
+            .engine
+            .register_input(
+                &args.run_slug,
+                &args.slug,
+                &args.title,
+                &args.input_type,
+                &args.content,
+                args.metadata,
+            )
+            .await
+        {
+            Ok(page) => Json(MutationResult::ok(format!("Input registered: {}", page.slug))),
+            Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
+        }
+    }
+
+    /// Record a finding produced by a research run.
+    #[tool(
+        name = "brain_record_finding",
+        description = "Create a finding page, link the research run to it with produces, \
+            and link the finding to supporting evidence/artifacts with supports edges."
+    )]
+    async fn record_finding(
+        &self,
+        Parameters(args): Parameters<RecordFindingArgs>,
+    ) -> Json<MutationResult> {
+        let supporting_slugs = args.supporting_slugs.unwrap_or_default();
+        match self
+            .engine
+            .record_finding(
+                &args.run_slug,
+                &args.slug,
+                &args.title,
+                &args.status,
+                &args.content,
+                &supporting_slugs,
+            )
+            .await
+        {
+            Ok(page) => Json(MutationResult::ok(format!(
+                "Finding recorded: {}",
+                page.slug
+            ))),
+            Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
+        }
+    }
+
+    /// Record a validation report for a research run artifact, finding, or input.
+    #[tool(
+        name = "brain_record_validation_report",
+        description = "Create a validation_report page, link the research run to it with produces, \
+            and link the report to validated pages with validates edges."
+    )]
+    async fn record_validation_report(
+        &self,
+        Parameters(args): Parameters<RecordValidationReportArgs>,
+    ) -> Json<MutationResult> {
+        let validates_slugs = args.validates_slugs.unwrap_or_default();
+        match self
+            .engine
+            .record_validation_report(
+                &args.run_slug,
+                &args.slug,
+                &args.title,
+                &args.validator,
+                &args.status,
+                &args.content,
+                &validates_slugs,
+                args.suggested_actions,
+            )
+            .await
+        {
+            Ok(page) => Json(MutationResult::ok(format!(
+                "Validation report recorded: {}",
+                page.slug
+            ))),
+            Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
+        }
+    }
+
+    /// Record an action item suggested by a validator, user, or agent.
+    #[tool(
+        name = "brain_record_action_item",
+        description = "Create an action_item page, link the research run to it with produces, \
+            and link the action item to its target pages with recommends edges."
+    )]
+    async fn record_action_item(
+        &self,
+        Parameters(args): Parameters<RecordActionItemArgs>,
+    ) -> Json<MutationResult> {
+        let target_slugs = args.target_slugs.unwrap_or_default();
+        match self
+            .engine
+            .record_action_item(
+                &args.run_slug,
+                &args.slug,
+                &args.title,
+                &args.action_kind,
+                &args.status,
+                &args.content,
+                &target_slugs,
+            )
+            .await
+        {
+            Ok(page) => Json(MutationResult::ok(format!(
+                "Action item recorded: {}",
+                page.slug
+            ))),
+            Err(e) => Json(MutationResult::err(format!("Failed: {}", e))),
+        }
+    }
+
+    /// Return the provenance graph around a finding, artifact, or run.
+    #[tool(
+        name = "brain_provenance_of",
+        description = "Return the local provenance graph around a page using research evidence edges \
+            such as produces, supports, derived_from, uses_dataset, uses_corpus, computed_by, validates."
+    )]
+    async fn provenance_of(
+        &self,
+        Parameters(args): Parameters<ProvenanceArgs>,
+    ) -> Json<ProvenanceResult> {
+        let depth = args.depth.map(|d| d.clamp(1, 5) as usize).unwrap_or(2);
+        match self.engine.provenance_of(&args.slug, depth).await {
+            Ok(graph) => Json(ProvenanceResult {
+                root_slug: graph.root_slug,
+                nodes: graph
+                    .nodes
+                    .into_iter()
+                    .map(|node| ProvenanceNode {
+                        slug: node.slug,
+                        page_type: node.page_type,
+                        title: node.title,
+                    })
+                    .collect(),
+                edges: graph
+                    .edges
+                    .into_iter()
+                    .map(|edge| ProvenanceEdge {
+                        source_slug: edge.source_slug,
+                        target_slug: edge.target_slug,
+                        edge_type: edge.edge_type,
+                        context: edge.context,
+                    })
+                    .collect(),
+            }),
+            Err(_) => Json(ProvenanceResult {
+                root_slug: args.slug,
+                nodes: vec![],
+                edges: vec![],
+            }),
         }
     }
 
@@ -639,10 +1067,7 @@ impl RBrainMcpServer {
     }
 
     /// Remove a tag from a page.
-    #[tool(
-        name = "brain_remove_tag",
-        description = "Remove a tag from a page."
-    )]
+    #[tool(name = "brain_remove_tag", description = "Remove a tag from a page.")]
     async fn remove_tag(&self, Parameters(args): Parameters<TagArgs>) -> Json<MutationResult> {
         match self.engine.remove_tag(&args.slug, &args.tag).await {
             Ok(_) => Json(MutationResult::ok(format!(

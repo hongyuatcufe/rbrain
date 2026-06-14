@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "validation_report frontmatter",
+  "type": "object",
+  "required": ["validator", "status"],
+  "properties": {
+    "type": { "const": "validation_report" },
+    "title": { "type": "string" },
+    "validator": { "type": "string", "minLength": 1 },
+    "status": { "type": "string", "minLength": 1 },
+    "target_count": { "type": "integer", "minimum": 0 },
+    "suggested_actions": {
+      "type": "array",
+      "items": { "type": "object" }
+    }
+  }
+}

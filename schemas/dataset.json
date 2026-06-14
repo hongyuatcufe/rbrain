@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "dataset frontmatter",
+  "type": "object",
+  "required": ["source"],
+  "properties": {
+    "type": { "const": "dataset" },
+    "title": { "type": "string" },
+    "source": { "type": "string", "minLength": 1 },
+    "path": { "type": "string" },
+    "hash": { "type": "string" },
+    "format": { "type": "string" },
+    "rows": { "type": ["integer", "null"] },
+    "columns": { "type": ["integer", "null"] }
+  }
+}

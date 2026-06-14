@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "citation_record frontmatter",
+  "type": "object",
+  "required": ["title", "authors", "year", "journal", "abstract", "source", "record_hash"],
+  "properties": {
+    "type": { "const": "citation_record" },
+    "title": { "type": "string", "minLength": 1 },
+    "authors": { "type": "array", "items": { "type": "string" } },
+    "year": { "type": "integer" },
+    "journal": { "type": "string", "minLength": 1 },
+    "keywords": { "type": "array", "items": { "type": "string" } },
+    "abstract": { "type": "string", "minLength": 1 },
+    "doi": { "type": ["string", "null"] },
+    "url": { "type": ["string", "null"] },
+    "source": { "type": "string", "minLength": 1 },
+    "language": { "type": "string" },
+    "corpus": { "type": "string" },
+    "ingested_at": { "type": "string" },
+    "record_hash": { "type": "string", "minLength": 1 }
+  }
+}
