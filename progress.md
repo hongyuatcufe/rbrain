@@ -80,6 +80,55 @@ Python / R / DuckDB / 浏览器 = 具体计算和外部操作
 
 ## 近期开发记录
 
+### 2026-06-15 — 数据污染与 research_run 账本语义修复
+
+**已完成**:
+
+1. 修复 slug/path 写入边界：
+   - `put_page()` 统一先校验并规范化 slug。
+   - 拒绝空 slug、绝对路径、`.` / `..` path component、反斜杠，防止 `../escaped` 这类路径越界写入。
+   - `delete_page()`、tag 写回、doctor orphan 检查等文件路径入口统一复用安全路径构造。
+2. 修复文件 slug 与 DB slug 不一致：
+   - `put_page()` 写文件、DB row、link source、embed job 全部使用同一个 normalized slug。
+   - `chunk_and_embed_page()` 删除旧 chunks、生成 chunk page_slug、标题前缀 fallback 均使用 normalized slug。
+3. 修复 `sync` / `import_dir` raw 污染：
+   - 拆出内部 `upsert_page_record()`，用于只更新 SQLite pages/links，不写回 Markdown 文件。
+   - `sync()` 和 `import_dir()` 从外部 Markdown 摄入 DB/图谱，但不再 canonicalize 或改写 raw 文献文件。
+4. 修复 dream timeline 污染：
+   - `dream_extract()` 仍可抽取 concept / figure 并建图。
+   - LLM 抽取出的 events 不再写入源页面 timeline，避免把推断事件或伪日期写回 raw。
+5. 补齐 validator 双落点：
+   - `validate_research_run()` 继续写正式 `validation_report` 与 `action_item`。
+   - 同时向对应 `research_run.timeline` append `source=validator, kind=validator_run` 审计日志。
+6. 补齐 research_run 默认元数据：
+   - `create_research_run()` 自动写入 `run_kind=custom`、`profile=custom`、`created_by=user`，为后续按 run_kind 分组 validators / pipeline 做准备。
+7. 修复迁移与链接写入问题：
+   - 将重复的 `0010_schema_version.sql` 顺延为 `0012_schema_version.sql`，避免 sqlx migration version 冲突。
+   - 新增 `0013_links_unique_chunk.sql` 显式补齐 links chunk 唯一索引。
+   - `add_link()` 改为显式查重后 update/insert，不再依赖 SQLite `ON CONFLICT` 目标一定存在。
+8. 修复测试基线：
+   - 删除 `rbrain-engine` 对不存在 `CiteEntry` 的 re-export。
+   - 将 chunker CJK / Other 测试期望同步为当前实现的 600/100。
+
+**新增回归测试**:
+
+- `test_put_page_rejects_path_traversal_slug`
+- `test_sync_imports_without_rewriting_raw_markdown`
+- `test_research_recording_api_writes_pages_and_provenance` 扩展 validator timeline 与 research_run 默认元数据断言
+- `test_dream_cycle_flow` 改为断言 dream 不写回 LLM timeline events
+
+**验证**:
+
+- `cargo fmt --all`
+- `cargo test -p rbrain-engine`
+- `cargo test --workspace`
+
+**待完成**:
+
+- `put_page()` 目前仍会重建该页面的 wikilink-derived links；后续应引入 `is_generated` 过滤，只删除/刷新自动抽取边，保留显式 provenance 边。
+- Markdown `---` 作为 timeline 分隔符仍与普通 Markdown 水平线存在语法歧义，后续应迁移到更明确的 timeline 存储/分隔方案。
+- MCP HTTP 远程绑定仍缺少 loopback/auth 防护，需要单独修复。
+
 ### 2026-06-14 — M1 检索增强第一切片
 
 **已完成**:
@@ -495,23 +544,25 @@ Python / R / DuckDB / 浏览器 = 具体计算和外部操作
 
 ## 已知限制
 
-1. **links 唯一约束**：`UNIQUE(source_slug, target_slug, edge_type)` — 同一来源同类型 link 改为 context 追加（`---` 分隔），仍是一行记录。如需完全独立的多条 link，需迁移 schema 加 `chunk_id` 列。
+1. **显式 provenance 边与自动 wikilink 边仍未完全隔离**：`links.is_generated` 字段已存在，但 `put_page()` 刷新正文 wikilinks 时还没有只删除 generated links。后续需要把自动抽取边标记为 `is_generated=1`，避免页面重写清掉显式研究证据链。
 
 2. **旧 evidence context 无 chunk ID 前缀**：Commit 6 之前通过 `--from-chunk` 存储的 context 没有 `[chunk:ID]` 前缀，新增的才有。
 
-3. **Dream cycle 仍是 hardcoded 流程**：自动维护（lint→embed→extract→synthesize）已经实现，但还不是 `plan.md` 中规划的 TOML-configurable Pipeline profile。
+3. **Dream cycle 仍是 hardcoded housekeeping 流程**：自动维护（lint→embed→extract→synthesize）仍在 engine 内硬编码；已停止写回 LLM timeline events，但还不是 `plan.md` 中规划的 TOML-configurable Pipeline profile。
 
-4. **缺少研究过程账本模型**：尚未实现 `research_run`、`dataset`、`artifact`、`finding`、`limitation` 等结构化记录 API。
+4. **研究过程账本模型仍是首版**：`research_run`、输入、artifact、finding、validation_report、action_item 的 Engine/MCP API 已实现，但 `run_kind` 还只是默认 `custom`，尚未提供显式参数和按 run_kind 分组的 pipeline/validator。
 
-5. **缺少结果核查层**：尚未实现 validator framework、provenance validator、citation/brief validator 和结构化 `suggested_actions`。
+5. **结果核查层仍不完整**：已有基础 validator framework、research_run validators、`validation_report` / `action_item` 落点和 validator timeline 审计；citation / literature-review / brief validators 尚未完整回迁。
 
 6. **缺少期刊引文库能力**：尚未实现 `citation_record`、`literature_corpus`、引文去重、定期简报、热点分析报告和用户推送流程。
 
-7. **缺少 schema 治理层**：尚未实现 `PageType` / `EdgeType`、frontmatter JSON schema、`schema_version` 和显式边类型约束。
+7. **schema 治理仍是轻量版**：已实现 `PageType` / `EdgeType`、轻量 frontmatter 校验、`schema_version` 与 schema 文件约定；尚未接入 `jsonschema` crate 做完整 runtime validation。
 
-8. **timeline 仍是字符串字段**：尚未重构为 `Vec<TimelineEntry>`，也还没有按 `source=user|validator|agent|script|llm` 区分审计日志来源。
+8. **timeline 仍是字符串字段**：当前以 String 存储 JSON timeline 数组并兼容旧文本；尚未把 `Page.timeline` 类型全面迁移为 `Vec<TimelineEntry>`。Markdown `---` 分隔符也仍有普通水平线歧义。
 
-9. **缺少 Swiftide 流程层**：尚未实现可选 `rbrain-agent` crate；当前 rbrain 只提供 CLI/MCP/Engine 能力。
+9. **MCP HTTP 暴露面仍需收紧**：HTTP server 仍可绑定非 loopback 地址，尚未加入认证或显式 `--allow-remote` 防护。
+
+10. **缺少 Swiftide 流程层**：尚未实现可选 `rbrain-agent` crate；当前 rbrain 只提供 CLI/MCP/Engine 能力。
 
 ---
 
@@ -525,12 +576,9 @@ Python / R / DuckDB / 浏览器 = 具体计算和外部操作
 
 ## 下一步（按优先级）
 
-1. M0 schema 治理：新增 `rbrain-core/src/schema.rs`，定义 `PageType` / `EdgeType`；建立 `schemas/*.json`；在写入入口做校验。
-2. M0 timeline 重定义：设计 `TimelineEntry` 并规划兼容迁移，确保 timeline 永不进入 embedding / indexing / 下游 LLM prompt。
-3. M1 回迁检索增强：按 PR-C1~C5 小步回迁标题前缀 embedding、ExplainedHit、page cap、JSON tag filter、intent-aware boost。
-4. M1/PR-D 回迁 research model 与 provenance edge 枚举，去除 rbrain-hub 的 TenantContext。
-5. M2 实现研究过程记录 API，所有输入必须走 M0 schema 和显式 EdgeType。
-6. M3 回迁 validator framework，validator 输出 append 到 timeline（source=validator）。
-7. M4 回迁 PipelineRunner，新增 `rbrain pipeline run`，`dream --profile` 保留为别名。
-8. M5 建立期刊引文库独立路径：`citations_query`、CSV/JSON 导入、dedupe、brief/hotspot 生成。
-9. M6 做 Swiftide 0.5-1 天 spike，再决定 `rbrain-agent` 是否基于 Swiftide；失败则走自实现兜底。
+1. 修复 links generated/manual 隔离：`put_page()` 只刷新 `is_generated=1` 的自动边，显式 provenance 边永不被正文重写清理。
+2. 收紧 MCP HTTP：默认只允许 loopback，远程绑定必须显式 `--allow-remote`，并评估 token/auth。
+3. M3 收尾：按 `run_kind` 分组 validators，继续回迁 citation / literature-review validators。
+4. M4 回迁 PipelineRunner，新增 `rbrain pipeline run`，`dream --profile` 保留为别名。
+5. M5 建立期刊引文库独立路径：`citations_query`、CSV/JSON 导入、dedupe、brief/hotspot 生成。
+6. M6 做 Swiftide 0.5-1 天 spike，再决定 `rbrain-agent` 是否基于 Swiftide；失败则走自实现兜底。

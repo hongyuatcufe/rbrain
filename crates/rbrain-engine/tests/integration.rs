@@ -6,7 +6,7 @@ use rbrain_core::embedder::Embedder;
 use rbrain_core::error::Result as BrainResult;
 use rbrain_core::keyword_index::KeywordIndex;
 use rbrain_core::page::{Language, Page};
-use rbrain_core::schema::TimelineEntry;
+use rbrain_core::schema::{TimelineEntry, TimelineSource};
 use rbrain_engine::Engine;
 use rbrain_llm::mock::MockEmbedder;
 use rbrain_search::TantivyIndex;
@@ -182,6 +182,61 @@ async fn test_structured_frontmatter_validation_accepts_citation_record() {
         fetched.schema_version,
         rbrain_core::schema::PageSchema::CURRENT_VERSION
     );
+}
+
+#[tokio::test]
+async fn test_put_page_rejects_path_traversal_slug() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    let err = engine
+        .put_page(Page::new(
+            "../escaped".to_string(),
+            "note".to_string(),
+            "This must not be written outside repo_dir.".to_string(),
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("invalid slug"), "{err}");
+    let escaped = tb
+        .config
+        .repo_dir
+        .parent()
+        .expect("repo_dir parent")
+        .join("escaped.md");
+    assert!(
+        !escaped.exists(),
+        "path traversal slug must not create {}",
+        escaped.display()
+    );
+}
+
+#[tokio::test]
+async fn test_sync_imports_without_rewriting_raw_markdown() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    let raw = "---\ntype: note\ntitle: Raw Note\ntags:\n  - raw\n---\nBody from raw file.\n";
+    let raw_path = tb.config.repo_dir.join("raw-note.md");
+    std::fs::write(&raw_path, raw).expect("write raw markdown");
+
+    let (imported, updated, orphaned) = engine.sync().await.expect("sync");
+    assert_eq!(imported, vec!["raw-note".to_string()]);
+    assert!(updated.is_empty());
+    assert!(orphaned.is_empty());
+
+    let after = std::fs::read_to_string(&raw_path).expect("read raw markdown");
+    assert_eq!(
+        after, raw,
+        "sync must not canonicalize or rewrite raw files"
+    );
+
+    let page = engine.get_page("raw-note").await.expect("get synced page");
+    assert_eq!(page.title, "Raw Note");
+    assert_eq!(page.tags, vec!["raw".to_string()]);
+    assert_eq!(page.compiled_truth, "Body from raw file.");
 }
 
 #[tokio::test]
@@ -366,6 +421,9 @@ async fn test_research_recording_api_writes_pages_and_provenance() {
         .expect("create_research_run");
     assert_eq!(run.slug, "research/runs/run-001");
     assert_eq!(run.page_type, "research_run");
+    assert_eq!(run.frontmatter["run_kind"], "custom");
+    assert_eq!(run.frontmatter["profile"], "custom");
+    assert_eq!(run.frontmatter["created_by"], "user");
 
     let dataset = engine
         .register_input(
@@ -444,56 +502,84 @@ async fn test_research_recording_api_writes_pages_and_provenance() {
     assert_eq!(action.page_type, "action_item");
 
     let run_outlinks = engine.outlinks(&run.slug).await.expect("run outlinks");
-    assert!(run_outlinks.iter().any(|link| {
-        link.target_slug == dataset.slug && link.edge_type == "uses_dataset"
-    }));
-    assert!(run_outlinks.iter().any(|link| {
-        link.target_slug == artifact.slug && link.edge_type == "produces"
-    }));
-    assert!(run_outlinks.iter().any(|link| {
-        link.target_slug == finding.slug && link.edge_type == "produces"
-    }));
-    assert!(run_outlinks.iter().any(|link| {
-        link.target_slug == report.slug && link.edge_type == "produces"
-    }));
-    assert!(run_outlinks.iter().any(|link| {
-        link.target_slug == action.slug && link.edge_type == "produces"
-    }));
+    assert!(
+        run_outlinks
+            .iter()
+            .any(|link| { link.target_slug == dataset.slug && link.edge_type == "uses_dataset" })
+    );
+    assert!(
+        run_outlinks
+            .iter()
+            .any(|link| { link.target_slug == artifact.slug && link.edge_type == "produces" })
+    );
+    assert!(
+        run_outlinks
+            .iter()
+            .any(|link| { link.target_slug == finding.slug && link.edge_type == "produces" })
+    );
+    assert!(
+        run_outlinks
+            .iter()
+            .any(|link| { link.target_slug == report.slug && link.edge_type == "produces" })
+    );
+    assert!(
+        run_outlinks
+            .iter()
+            .any(|link| { link.target_slug == action.slug && link.edge_type == "produces" })
+    );
 
     let finding_outlinks = engine
         .outlinks(&finding.slug)
         .await
         .expect("finding outlinks");
-    assert!(finding_outlinks.iter().any(|link| {
-        link.target_slug == artifact.slug && link.edge_type == "supports"
-    }));
+    assert!(
+        finding_outlinks
+            .iter()
+            .any(|link| { link.target_slug == artifact.slug && link.edge_type == "supports" })
+    );
 
     let report_outlinks = engine
         .outlinks(&report.slug)
         .await
         .expect("report outlinks");
-    assert!(report_outlinks.iter().any(|link| {
-        link.target_slug == finding.slug && link.edge_type == "validates"
-    }));
-    assert!(report_outlinks.iter().any(|link| {
-        link.target_slug == dataset.slug && link.edge_type == "validates"
-    }));
+    assert!(
+        report_outlinks
+            .iter()
+            .any(|link| { link.target_slug == finding.slug && link.edge_type == "validates" })
+    );
+    assert!(
+        report_outlinks
+            .iter()
+            .any(|link| { link.target_slug == dataset.slug && link.edge_type == "validates" })
+    );
 
     let action_outlinks = engine
         .outlinks(&action.slug)
         .await
         .expect("action outlinks");
-    assert!(action_outlinks.iter().any(|link| {
-        link.target_slug == finding.slug && link.edge_type == "recommends"
-    }));
+    assert!(
+        action_outlinks
+            .iter()
+            .any(|link| { link.target_slug == finding.slug && link.edge_type == "recommends" })
+    );
 
     let provenance = engine
         .provenance_of(&finding.slug, 2)
         .await
         .expect("provenance_of");
     assert!(provenance.nodes.iter().any(|node| node.slug == run.slug));
-    assert!(provenance.nodes.iter().any(|node| node.slug == artifact.slug));
-    assert!(provenance.nodes.iter().any(|node| node.slug == dataset.slug));
+    assert!(
+        provenance
+            .nodes
+            .iter()
+            .any(|node| node.slug == artifact.slug)
+    );
+    assert!(
+        provenance
+            .nodes
+            .iter()
+            .any(|node| node.slug == dataset.slug)
+    );
     assert!(provenance.nodes.iter().any(|node| node.slug == report.slug));
     assert!(provenance.nodes.iter().any(|node| node.slug == action.slug));
     assert!(provenance.edges.iter().any(|edge| {
@@ -531,28 +617,57 @@ async fn test_research_recording_api_writes_pages_and_provenance() {
         result.validator == "artifact_hash_present" && result.status.as_str() == "warn"
     }));
 
+    let validated_run = engine.get_page(&run.slug).await.expect("get validated run");
+    let timeline =
+        TimelineEntry::parse_compat(&validated_run.timeline).expect("parse run timeline");
+    assert!(timeline.iter().any(|entry| {
+        entry.source == TimelineSource::Validator
+            && entry.kind == "validator_run"
+            && entry.payload["validator"] == "artifact_hash_present"
+    }));
+
     let protocol = engine
         .get_research_protocol(&run.slug)
         .await
         .expect("get_research_protocol");
     assert_eq!(protocol.run.slug, run.slug);
     assert!(protocol.inputs.iter().any(|page| page.slug == dataset.slug));
-    assert!(protocol.artifacts.iter().any(|page| page.slug == artifact.slug));
-    assert!(protocol.findings.iter().any(|page| page.slug == finding.slug));
-    assert!(protocol
-        .validation_reports
-        .iter()
-        .any(|page| page.slug == report.slug));
-    assert!(protocol
-        .action_items
-        .iter()
-        .any(|page| page.slug == action.slug));
-    assert!(protocol.validation_reports.iter().any(|page| {
-        page.slug == format!("{}/validation/artifact_hash_present", run.slug)
-    }));
-    assert!(protocol.action_items.iter().any(|page| {
-        page.slug == format!("{}/actions/artifact_hash_present-1", run.slug)
-    }));
+    assert!(
+        protocol
+            .artifacts
+            .iter()
+            .any(|page| page.slug == artifact.slug)
+    );
+    assert!(
+        protocol
+            .findings
+            .iter()
+            .any(|page| page.slug == finding.slug)
+    );
+    assert!(
+        protocol
+            .validation_reports
+            .iter()
+            .any(|page| page.slug == report.slug)
+    );
+    assert!(
+        protocol
+            .action_items
+            .iter()
+            .any(|page| page.slug == action.slug)
+    );
+    assert!(
+        protocol
+            .validation_reports
+            .iter()
+            .any(|page| { page.slug == format!("{}/validation/artifact_hash_present", run.slug) })
+    );
+    assert!(
+        protocol
+            .action_items
+            .iter()
+            .any(|page| { page.slug == format!("{}/actions/artifact_hash_present-1", run.slug) })
+    );
     assert!(protocol.edges.iter().any(|edge| {
         edge.source_slug == report.slug
             && edge.target_slug == finding.slug
@@ -859,13 +974,13 @@ async fn test_dream_cycle_flow() {
         .expect("get figure page");
     assert_eq!(figure_page.title, "BERT");
 
-    // 3. Verify that timeline entry was added to paper-1/paper-2
+    // 3. Verify that LLM-extracted timeline events were not written back to source pages
     let fetched_p1 = engine.get_page("paper-1").await.expect("get page1");
     assert!(
-        fetched_p1
+        !fetched_p1
             .timeline
             .contains("BERT model was officially released"),
-        "Timeline event not found: {}",
+        "dream extraction must not mutate source timeline: {}",
         fetched_p1.timeline
     );
 

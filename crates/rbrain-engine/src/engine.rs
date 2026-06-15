@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,6 +49,15 @@ struct EngineInner {
 }
 
 impl Engine {
+    fn page_path(&self, slug: &str) -> Result<PathBuf> {
+        let normalized = validate_slug(slug)?;
+        Ok(self
+            .inner
+            .config
+            .repo_dir
+            .join(format!("{}.md", normalized)))
+    }
+
     /// Open engine without embedding/vector search capabilities
     pub async fn open(config: Config) -> Result<Self> {
         let db = rbrain_db::open_database(&config.db_path).await?;
@@ -108,7 +118,8 @@ impl Engine {
     pub async fn put_page(&self, page: Page) -> Result<()> {
         PageSchema::validate_frontmatter(&page.page_type, &page.frontmatter)?;
 
-        let repo_path = self.inner.config.repo_dir.join(format!("{}.md", page.slug));
+        let normalized_slug = validate_slug(&page.slug)?;
+        let repo_path = self.page_path(&normalized_slug)?;
 
         if repo_path.exists() {
             let existing_content = std::fs::read_to_string(&repo_path)?;
@@ -116,7 +127,7 @@ impl Engine {
 
             let db_hash: Option<String> =
                 sqlx::query_scalar("SELECT content_hash FROM pages WHERE slug = ?1")
-                    .bind(&page.slug)
+                    .bind(&normalized_slug)
                     .fetch_optional(&self.inner.db)
                     .await
                     .map_err(|e| {
@@ -135,7 +146,6 @@ impl Engine {
         let canonical =
             MarkdownParser::to_canonical(&page.frontmatter, &page.compiled_truth, &page.timeline);
         let content_hash = MarkdownParser::content_hash(&canonical);
-        let normalized_slug = MarkdownParser::normalize_slug(&page.slug);
 
         if let Some(parent) = repo_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -146,6 +156,24 @@ impl Engine {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp_path, &repo_path)?;
+
+        self.upsert_page_record(&page, &normalized_slug, &content_hash)
+            .await?;
+
+        if self.inner.embedder.is_some() && self.inner.vector_store.is_some() {
+            self.submit_embed_job(&normalized_slug).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn upsert_page_record(
+        &self,
+        page: &Page,
+        normalized_slug: &str,
+        content_hash: &str,
+    ) -> Result<()> {
+        PageSchema::validate_frontmatter(&page.page_type, &page.frontmatter)?;
 
         let tags_json = serde_json::to_string(&page.tags)?;
         let frontmatter_json = serde_json::to_string(&page.frontmatter)?;
@@ -192,10 +220,6 @@ impl Engine {
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         }
 
-        if self.inner.embedder.is_some() && self.inner.vector_store.is_some() {
-            self.submit_embed_job(&page.slug).await?;
-        }
-
         Ok(())
     }
 
@@ -221,6 +245,7 @@ impl Engine {
     }
 
     pub async fn chunk_and_embed_page(&self, page: &Page) -> Result<()> {
+        let normalized_slug = validate_slug(&page.slug)?;
         let embedder = self
             .inner
             .embedder
@@ -247,7 +272,7 @@ impl Engine {
                 })?;
 
         sqlx::query("DELETE FROM chunks WHERE page_slug = ?1")
-            .bind(&page.slug)
+            .bind(&normalized_slug)
             .execute(&self.inner.db)
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -259,10 +284,10 @@ impl Engine {
 
         let chunker = Chunker::new(&lang);
 
-        let compiled_truth_chunks = chunker.chunk(&page.compiled_truth, &page.slug, &lang);
+        let compiled_truth_chunks = chunker.chunk(&page.compiled_truth, &normalized_slug, &lang);
 
         let title_prefix = if page.title.trim().is_empty() {
-            format!("[{}]\n\n", page.slug)
+            format!("[{}]\n\n", normalized_slug)
         } else {
             format!("[{}]\n\n", page.title.trim())
         };
@@ -395,12 +420,8 @@ impl Engine {
     }
 
     pub async fn delete_page(&self, slug: &str) -> Result<()> {
-        let normalized = MarkdownParser::normalize_slug(slug);
-        let repo_path = self
-            .inner
-            .config
-            .repo_dir
-            .join(format!("{}.md", normalized));
+        let normalized = validate_slug(slug)?;
+        let repo_path = self.page_path(&normalized)?;
 
         let chunk_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM chunks WHERE page_slug = ?1")
             .bind(&normalized)
@@ -563,13 +584,14 @@ impl Engine {
                 .to_string_lossy()
                 .trim_end_matches(".md")
                 .replace(std::path::MAIN_SEPARATOR, "/");
+            let normalized = validate_slug(&slug)?;
 
             let content = std::fs::read_to_string(path)?;
             let hash = MarkdownParser::content_hash(&content);
 
             let db_hash: Option<String> =
                 sqlx::query_scalar("SELECT content_hash FROM pages WHERE slug = ?")
-                    .bind(&slug)
+                    .bind(&normalized)
                     .fetch_optional(&self.inner.db)
                     .await
                     .map_err(|e| {
@@ -578,12 +600,12 @@ impl Engine {
 
             match db_hash {
                 Some(existing_hash) if existing_hash == hash => {
-                    db_slug_set.remove(&slug);
+                    db_slug_set.remove(&normalized);
                 }
                 Some(_) => {
                     let parse_result = MarkdownParser::parse(&content);
                     let mut page = Page::new(
-                        MarkdownParser::normalize_slug(&slug),
+                        normalized.clone(),
                         parse_result
                             .frontmatter
                             .get("type")
@@ -604,14 +626,14 @@ impl Engine {
                             .filter_map(|v| v.as_str().map(|s| s.to_string()))
                             .collect();
                     }
-                    self.put_page(page).await?;
+                    self.upsert_page_record(&page, &normalized, &hash).await?;
                     updated.push(slug.clone());
-                    db_slug_set.remove(&slug);
+                    db_slug_set.remove(&normalized);
                 }
                 None => {
                     let parse_result = MarkdownParser::parse(&content);
                     let mut page = Page::new(
-                        MarkdownParser::normalize_slug(&slug),
+                        normalized.clone(),
                         parse_result
                             .frontmatter
                             .get("type")
@@ -632,9 +654,9 @@ impl Engine {
                             .filter_map(|v| v.as_str().map(|s| s.to_string()))
                             .collect();
                     }
-                    self.put_page(page).await?;
+                    self.upsert_page_record(&page, &normalized, &hash).await?;
                     imported.push(slug.clone());
-                    db_slug_set.remove(&slug);
+                    db_slug_set.remove(&normalized);
                 }
             }
         }
@@ -675,7 +697,7 @@ impl Engine {
                 .trim_end_matches(".md")
                 .trim()
                 .replace(std::path::MAIN_SEPARATOR, "/");
-            let normalized = MarkdownParser::normalize_slug(&slug);
+            let normalized = validate_slug(&slug)?;
 
             let db_hash: Option<String> =
                 sqlx::query_scalar("SELECT content_hash FROM pages WHERE slug = ?")
@@ -715,7 +737,7 @@ impl Engine {
 
             page.language = Some(rbrain_core::page::Language::detect(&page.compiled_truth));
 
-            self.put_page(page.clone()).await?;
+            self.upsert_page_record(&page, &normalized, &hash).await?;
             if self.has_embedder() {
                 if let Err(e) = self.chunk_and_embed_page(&page).await {
                     tracing::warn!("embed failed for {}: {}", page.slug, e);
@@ -1361,25 +1383,40 @@ impl Engine {
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
         .flatten();
 
+        let has_existing = existing_context.is_some();
         let merged_context = match (existing_context, context) {
             (Some(existing), Some(new)) => Some(format!("{}\n\n---\n\n{}", existing, new)),
             (Some(existing), None) => Some(existing),
             (None, new) => new.map(|s| s.to_string()),
         };
 
-        sqlx::query(
-            "INSERT INTO links (source_slug, target_slug, edge_type, context, created_at, chunk_id) \
-             VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5) \
-             ON CONFLICT(source_slug, target_slug, edge_type, chunk_id) DO UPDATE SET context = ?4",
-        )
-        .bind(&source)
-        .bind(&target)
-        .bind(edge_type)
-        .bind(merged_context.as_deref())
-        .bind(cid)
-        .execute(&self.inner.db)
-        .await
-        .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        if has_existing {
+            sqlx::query(
+                "UPDATE links SET context = ?1 \
+                 WHERE source_slug = ?2 AND target_slug = ?3 AND edge_type = ?4 AND chunk_id = ?5",
+            )
+            .bind(merged_context.as_deref())
+            .bind(&source)
+            .bind(&target)
+            .bind(edge_type)
+            .bind(cid)
+            .execute(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        } else {
+            sqlx::query(
+                "INSERT INTO links (source_slug, target_slug, edge_type, context, created_at, chunk_id) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5)",
+            )
+            .bind(&source)
+            .bind(&target)
+            .bind(edge_type)
+            .bind(merged_context.as_deref())
+            .bind(cid)
+            .execute(&self.inner.db)
+            .await
+            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        }
         Ok(())
     }
 
@@ -1483,8 +1520,7 @@ impl Engine {
         text: &str,
         source: Option<&str>,
     ) -> Result<()> {
-        let normalized = MarkdownParser::normalize_slug(slug);
-        let page = self.get_page(&normalized).await?;
+        let normalized = validate_slug(slug)?;
         let mut payload = serde_json::json!({
             "date": date,
             "text": text,
@@ -1493,44 +1529,14 @@ impl Engine {
             payload["source"] = serde_json::Value::String(src.to_string());
         }
         let entry = TimelineEntry::new(TimelineSource::User, "dated_event", payload);
-        let new_timeline = TimelineEntry::prepend_compat(&page.timeline, entry)?;
-
-        sqlx::query("UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2")
-            .bind(&new_timeline)
-            .bind(&normalized)
-            .execute(&self.inner.db)
+        self.write_timeline_entry(&normalized, entry, true, true)
             .await
-            .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        // Mirror to filesystem
-        let repo_path = self
-            .inner
-            .config
-            .repo_dir
-            .join(format!("{}.md", normalized));
-        if repo_path.exists() {
-            let canonical = MarkdownParser::to_canonical(
-                &page.frontmatter,
-                &page.compiled_truth,
-                &new_timeline,
-            );
-            std::fs::write(&repo_path, &canonical)?;
-            let new_hash = MarkdownParser::content_hash(&canonical);
-            sqlx::query("UPDATE pages SET content_hash = ?1 WHERE slug = ?2")
-                .bind(&new_hash)
-                .bind(&normalized)
-                .execute(&self.inner.db)
-                .await
-                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        }
-        Ok(())
     }
 
     /// Append a short interpretive take to a page's timeline section.
     /// Direct SQL UPDATE — does NOT touch the links table, preserving explicit graph links.
     pub async fn add_take(&self, slug: &str, content: &str, kind: &str) -> Result<()> {
-        let normalized = MarkdownParser::normalize_slug(slug);
-        let page = self.get_page(&normalized).await?;
+        let normalized = validate_slug(slug)?;
         let entry = TimelineEntry::new(
             TimelineSource::User,
             "take",
@@ -1539,8 +1545,24 @@ impl Engine {
                 "text": content,
             }),
         );
-        let new_timeline = TimelineEntry::append_compat(&page.timeline, entry)?;
+        self.write_timeline_entry(&normalized, entry, false, true)
+            .await
+    }
 
+    async fn write_timeline_entry(
+        &self,
+        slug: &str,
+        entry: TimelineEntry,
+        prepend: bool,
+        mirror_to_file: bool,
+    ) -> Result<()> {
+        let normalized = validate_slug(slug)?;
+        let page = self.get_page(&normalized).await?;
+        let new_timeline = if prepend {
+            TimelineEntry::prepend_compat(&page.timeline, entry)?
+        } else {
+            TimelineEntry::append_compat(&page.timeline, entry)?
+        };
         sqlx::query("UPDATE pages SET timeline = ?1, updated_at = datetime('now') WHERE slug = ?2")
             .bind(&new_timeline)
             .bind(&normalized)
@@ -1548,13 +1570,11 @@ impl Engine {
             .await
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        // Mirror to filesystem
-        let repo_path = self
-            .inner
-            .config
-            .repo_dir
-            .join(format!("{}.md", normalized));
-        if repo_path.exists() {
+        if mirror_to_file {
+            let repo_path = self.page_path(&normalized)?;
+            if !repo_path.exists() {
+                return Ok(());
+            }
             let canonical = MarkdownParser::to_canonical(
                 &page.frontmatter,
                 &page.compiled_truth,
@@ -1669,9 +1689,12 @@ impl Engine {
         page.frontmatter = serde_json::json!({
             "type": "research_run",
             "run_id": run_id,
+            "run_kind": "custom",
             "status": "active",
             "title": page.title,
-            "question": question.unwrap_or("")
+            "question": question.unwrap_or(""),
+            "created_by": "user",
+            "profile": "custom"
         });
 
         self.put_page(page.clone()).await?;
@@ -2045,6 +2068,21 @@ impl Engine {
         )
         .await?;
 
+        let audit_entry = TimelineEntry::new(
+            TimelineSource::Validator,
+            "validator_run",
+            serde_json::json!({
+                "validator": result.validator,
+                "status": result.status.as_str(),
+                "message": result.message,
+                "affected_slugs": result.affected_slugs,
+                "validation_report": report_slug,
+                "suggested_action_count": result.suggested_actions.len()
+            }),
+        );
+        self.write_timeline_entry(run_slug, audit_entry, false, true)
+            .await?;
+
         for (idx, action) in result.suggested_actions.iter().enumerate() {
             let action_slug = format!(
                 "{}/actions/{}-{}",
@@ -2111,9 +2149,7 @@ impl Engine {
                 .bind(&current)
                 .fetch_all(&self.inner.db)
                 .await
-                .map_err(|e| {
-                    BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
-                })?;
+                .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
                 for row in rows {
                     let edge_type: String = row.get("edge_type");
@@ -2331,7 +2367,7 @@ impl Engine {
                 .unwrap_or_default();
 
             for slug in db_slugs {
-                let md_path = repo_dir.join(format!("{}.md", slug));
+                let md_path = self.page_path(&slug)?;
                 if !md_path.exists() {
                     issues.push(format!("Orphan page: {}", slug));
                 }
@@ -2450,7 +2486,7 @@ impl Engine {
 
         let mut orphaned = Vec::new();
         for slug in db_slugs {
-            let md_path = repo_dir.join(format!("{}.md", slug));
+            let md_path = self.page_path(&slug)?;
             if !md_path.exists() {
                 orphaned.push(slug);
             }
@@ -2520,7 +2556,7 @@ impl Engine {
                 .await
                 .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-            let repo_path = self.inner.config.repo_dir.join(format!("{}.md", page.slug));
+            let repo_path = self.page_path(&page.slug)?;
             if repo_path.exists() {
                 let content = std::fs::read_to_string(&repo_path)?;
                 let updated = update_frontmatter_tags(&content, &page.tags);
@@ -2553,7 +2589,7 @@ impl Engine {
                 .await
                 .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-            let repo_path = self.inner.config.repo_dir.join(format!("{}.md", page.slug));
+            let repo_path = self.page_path(&page.slug)?;
             if repo_path.exists() {
                 let content = std::fs::read_to_string(&repo_path)?;
                 let updated = update_frontmatter_tags(&content, &page.tags);
@@ -2972,29 +3008,18 @@ impl Engine {
                 }
             }
 
-            // 3. Save extracted events
-            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-            for event in &knowledge.events {
-                if event.description.trim().is_empty() {
-                    continue;
-                }
-                let date_str = if event.date.trim().is_empty() {
-                    &today
-                } else {
-                    &event.date
-                };
-                let event_src = Some(title.as_str());
-                if let Err(e) = self
-                    .add_timeline_entry(&slug, date_str, &event.description, event_src)
-                    .await
-                {
-                    eprintln!("    WARN: failed to add timeline entry to {}: {}", slug, e);
-                } else {
-                    println!(
-                        "    Added timeline event: {} on {}",
-                        event.description, date_str
-                    );
-                }
+            // 3. Extracted LLM events are intentionally not written back to source timelines.
+            // Timeline is an audit log; formal claims should become findings/artifacts via pipeline.
+            let event_count = knowledge
+                .events
+                .iter()
+                .filter(|event| !event.description.trim().is_empty())
+                .count();
+            if event_count > 0 {
+                println!(
+                    "    Skipped {} LLM-extracted timeline event(s); dream extraction does not mutate source timelines.",
+                    event_count
+                );
             }
 
             // Update dream_metadata
@@ -3445,4 +3470,39 @@ fn slugify(s: &str) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+fn validate_slug(slug: &str) -> Result<String> {
+    let normalized = MarkdownParser::normalize_slug(slug.trim());
+    if normalized.is_empty() {
+        return Err(BrainError::Conflict("slug cannot be empty".to_string()));
+    }
+    if normalized.contains('\\') {
+        return Err(BrainError::Conflict(format!(
+            "invalid slug '{}': backslashes are not allowed",
+            slug
+        )));
+    }
+
+    let path = Path::new(&normalized);
+    if path.is_absolute() {
+        return Err(BrainError::Conflict(format!(
+            "invalid slug '{}': absolute paths are not allowed",
+            slug
+        )));
+    }
+
+    for component in path.components() {
+        match component {
+            Component::Normal(part) if !part.is_empty() => {}
+            _ => {
+                return Err(BrainError::Conflict(format!(
+                    "invalid slug '{}': path traversal or empty path component",
+                    slug
+                )));
+            }
+        }
+    }
+
+    Ok(normalized)
 }

@@ -74,7 +74,10 @@ impl Chunker {
             if current_text.len() + trimmed.len() > self.target_chars && !current_text.is_empty() {
                 let overlap = if current_text.len() > self.overlap_chars {
                     // Use char_indices to safely find character boundary
-                    let chars_to_skip = current_text.chars().count().saturating_sub(self.overlap_chars);
+                    let chars_to_skip = current_text
+                        .chars()
+                        .count()
+                        .saturating_sub(self.overlap_chars);
                     current_text.chars().skip(chars_to_skip).collect::<String>()
                 } else {
                     current_text.clone()
@@ -174,20 +177,20 @@ mod tests {
     #[test]
     fn test_chunker_new_cjk() {
         let chunker = Chunker::new(&Language::Ja);
-        assert_eq!(chunker.target_chars, 400);
-        assert_eq!(chunker.overlap_chars, 50);
+        assert_eq!(chunker.target_chars, 600);
+        assert_eq!(chunker.overlap_chars, 100);
 
         let chunker = Chunker::new(&Language::ZhHans);
-        assert_eq!(chunker.target_chars, 400);
-        assert_eq!(chunker.overlap_chars, 50);
+        assert_eq!(chunker.target_chars, 600);
+        assert_eq!(chunker.overlap_chars, 100);
 
         let chunker = Chunker::new(&Language::ZhHant);
-        assert_eq!(chunker.target_chars, 400);
-        assert_eq!(chunker.overlap_chars, 50);
+        assert_eq!(chunker.target_chars, 600);
+        assert_eq!(chunker.overlap_chars, 100);
 
         let chunker = Chunker::new(&Language::Ko);
-        assert_eq!(chunker.target_chars, 400);
-        assert_eq!(chunker.overlap_chars, 50);
+        assert_eq!(chunker.target_chars, 600);
+        assert_eq!(chunker.overlap_chars, 100);
     }
 
     #[test]
@@ -200,8 +203,8 @@ mod tests {
     #[test]
     fn test_chunker_new_other() {
         let chunker = Chunker::new(&Language::Other("fr".to_string()));
-        assert_eq!(chunker.target_chars, 400);
-        assert_eq!(chunker.overlap_chars, 50);
+        assert_eq!(chunker.target_chars, 600);
+        assert_eq!(chunker.overlap_chars, 100);
     }
 
     #[test]
