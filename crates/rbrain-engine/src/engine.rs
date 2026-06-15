@@ -180,9 +180,20 @@ impl Engine {
         let language_str = page.language.as_ref().map(|l| l.to_string());
 
         sqlx::query(
-            "INSERT OR REPLACE INTO pages \
+            "INSERT INTO pages \
              (slug, page_type, title, tags, frontmatter, compiled_truth, timeline, language, content_hash, schema_version, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'), datetime('now'))",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'), datetime('now')) \
+             ON CONFLICT(slug) DO UPDATE SET \
+             page_type = excluded.page_type, \
+             title = excluded.title, \
+             tags = excluded.tags, \
+             frontmatter = excluded.frontmatter, \
+             compiled_truth = excluded.compiled_truth, \
+             timeline = excluded.timeline, \
+             language = excluded.language, \
+             content_hash = excluded.content_hash, \
+             schema_version = excluded.schema_version, \
+             updated_at = datetime('now')",
         )
         .bind(&normalized_slug)
         .bind(&page.page_type)
@@ -198,7 +209,7 @@ impl Engine {
         .await
         .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        sqlx::query("DELETE FROM links WHERE source_slug = ?1")
+        sqlx::query("DELETE FROM links WHERE source_slug = ?1 AND is_generated = 1")
             .bind(&normalized_slug)
             .execute(&self.inner.db)
             .await
@@ -208,8 +219,8 @@ impl Engine {
         for link in links {
             sqlx::query(
                 "INSERT OR IGNORE INTO links \
-                 (source_slug, target_slug, edge_type, context, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                 (source_slug, target_slug, edge_type, context, created_at, is_generated) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), 1)",
             )
             .bind(&normalized_slug)
             .bind(&link.target_slug)
@@ -1392,7 +1403,7 @@ impl Engine {
 
         if has_existing {
             sqlx::query(
-                "UPDATE links SET context = ?1 \
+                "UPDATE links SET context = ?1, is_generated = 0 \
                  WHERE source_slug = ?2 AND target_slug = ?3 AND edge_type = ?4 AND chunk_id = ?5",
             )
             .bind(merged_context.as_deref())
@@ -1405,8 +1416,8 @@ impl Engine {
             .map_err(|e| BrainError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         } else {
             sqlx::query(
-                "INSERT INTO links (source_slug, target_slug, edge_type, context, created_at, chunk_id) \
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5)",
+                "INSERT INTO links (source_slug, target_slug, edge_type, context, created_at, chunk_id, is_generated) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, 0)",
             )
             .bind(&source)
             .bind(&target)

@@ -10,6 +10,7 @@ use rbrain_core::schema::TimelineEntry;
 use rbrain_engine::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -976,6 +977,16 @@ async fn list_tools() -> impl IntoResponse {
 
 /// Run the HTTP MCP server
 pub async fn run_http_server(engine: Engine, addr: &str) -> anyhow::Result<()> {
+    run_http_server_with_options(engine, addr, false).await
+}
+
+/// Run the HTTP MCP server with explicit remote binding control.
+pub async fn run_http_server_with_options(
+    engine: Engine,
+    addr: &str,
+    allow_remote: bool,
+) -> anyhow::Result<()> {
+    validate_http_bind_addr(addr, allow_remote)?;
     let state = Arc::new(AppState::new(engine));
 
     let app = Router::new()
@@ -988,4 +999,59 @@ pub async fn run_http_server(engine: Engine, addr: &str) -> anyhow::Result<()> {
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn validate_http_bind_addr(addr: &str, allow_remote: bool) -> anyhow::Result<()> {
+    if allow_remote {
+        return Ok(());
+    }
+
+    let parsed = resolve_bind_addr(addr)?;
+    if parsed.ip().is_loopback() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "refusing to bind MCP HTTP server to non-loopback address '{}'; use --allow-remote only behind a trusted boundary",
+        addr
+    )
+}
+
+fn resolve_bind_addr(addr: &str) -> anyhow::Result<SocketAddr> {
+    if let Ok(parsed) = addr.parse::<SocketAddr>() {
+        return Ok(parsed);
+    }
+
+    let addrs = addr.to_socket_addrs()?.collect::<Vec<_>>();
+    addrs
+        .iter()
+        .copied()
+        .find(|candidate| candidate.ip().is_loopback())
+        .or_else(|| addrs.into_iter().next())
+        .ok_or_else(|| anyhow::anyhow!("unable to resolve bind address '{}'", addr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_http_bind_addr;
+
+    #[test]
+    fn allows_loopback_http_bind_by_default() {
+        validate_http_bind_addr("127.0.0.1:8765", false).expect("loopback allowed");
+        validate_http_bind_addr("[::1]:8765", false).expect("ipv6 loopback allowed");
+        validate_http_bind_addr("localhost:8765", false).expect("localhost allowed");
+    }
+
+    #[test]
+    fn rejects_remote_http_bind_by_default() {
+        let err = validate_http_bind_addr("0.0.0.0:8765", false)
+            .expect_err("wildcard bind should require allow_remote")
+            .to_string();
+        assert!(err.contains("refusing to bind"), "{err}");
+    }
+
+    #[test]
+    fn allows_remote_http_bind_when_explicit() {
+        validate_http_bind_addr("0.0.0.0:8765", true).expect("remote allowed explicitly");
+    }
 }

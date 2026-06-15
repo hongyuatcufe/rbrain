@@ -80,6 +80,59 @@ Python / R / DuckDB / 浏览器 = 具体计算和外部操作
 
 ## 近期开发记录
 
+### 2026-06-15 — MCP HTTP loopback 默认限制
+
+**已完成**:
+
+1. 收紧 MCP HTTP 绑定边界：
+   - `rbrain serve mcp --http <addr>` 默认只允许 loopback 地址。
+   - `127.0.0.1`、`[::1]`、`localhost` 可直接启动。
+   - `0.0.0.0` 等非 loopback 地址默认拒绝，避免无认证 mutation tools 暴露到网络。
+2. 新增显式远程绑定开关：
+   - CLI 增加 `--allow-remote`。
+   - 只有显式传入 `rbrain serve mcp --http 0.0.0.0:3456 --allow-remote` 才允许远程绑定。
+   - library 层保留 `run_http_server()` 的安全默认值，并新增 `run_http_server_with_options()` 供 CLI 显式传参。
+3. 补齐测试和文档：
+   - 单元测试覆盖 loopback 默认允许、wildcard 默认拒绝、显式远程允许。
+   - README 补充 `--allow-remote` 用法和信任边界说明。
+
+**验证**:
+
+- `cargo test -p rbrain-mcp`
+- `cargo test -p rbrain-cli -p rbrain-mcp --no-run`
+- `cargo test --workspace`
+
+**待完成**:
+
+- 暂不引入 token/auth；如果未来确实需要长期远程 HTTP 服务，应在 reverse proxy / tunnel 之外增加 MCP 层认证。
+
+### 2026-06-15 — links generated/manual 隔离
+
+**已完成**:
+
+1. 自动 wikilink 边与显式 provenance 边隔离：
+   - `put_page()` / `sync()` / `import_dir()` 刷新页面时只删除 `is_generated=1` 的自动抽取边。
+   - 从 `compiled_truth` 抽取出的 wikilink 边写入 `is_generated=1`。
+   - `add_link()` 创建或更新的显式边写入 `is_generated=0`，用于 research_run provenance、人工证据链和 MCP 显式链接。
+2. 修复页面 UPSERT 触发级联删除的问题：
+   - `upsert_page_record()` 不再使用 `INSERT OR REPLACE INTO pages`。
+   - 改为 `INSERT ... ON CONFLICT(slug) DO UPDATE`，保留 page row identity，避免 SQLite REPLACE 先删除旧 row 导致 `links.source_slug REFERENCES pages(slug) ON DELETE CASCADE` 把显式 links 一并删除。
+3. 新增回归测试：
+   - `test_put_page_refreshes_generated_links_without_deleting_explicit_links`
+   - 覆盖：页面正文 wikilink 从 old target 改到 new target 后，旧自动边删除、新自动边建立、显式 `supports` provenance 边保留。
+4. 更新协作规则：
+   - `AGENTS.md` 新增：开发前对照 `plan.md` / `progress.md`，开发后及时更新 `progress.md`。
+
+**验证**:
+
+- `cargo test -p rbrain-engine test_put_page_refreshes_generated_links_without_deleting_explicit_links`
+- `cargo test -p rbrain-engine`
+- `cargo test --workspace`
+
+**待完成**:
+
+- M3 validator 收尾是下一优先级。
+
 ### 2026-06-15 — 数据污染与 research_run 账本语义修复
 
 **已完成**:
@@ -125,9 +178,7 @@ Python / R / DuckDB / 浏览器 = 具体计算和外部操作
 
 **待完成**:
 
-- `put_page()` 目前仍会重建该页面的 wikilink-derived links；后续应引入 `is_generated` 过滤，只删除/刷新自动抽取边，保留显式 provenance 边。
 - Markdown `---` 作为 timeline 分隔符仍与普通 Markdown 水平线存在语法歧义，后续应迁移到更明确的 timeline 存储/分隔方案。
-- MCP HTTP 远程绑定仍缺少 loopback/auth 防护，需要单独修复。
 
 ### 2026-06-14 — M1 检索增强第一切片
 
@@ -544,25 +595,23 @@ Python / R / DuckDB / 浏览器 = 具体计算和外部操作
 
 ## 已知限制
 
-1. **显式 provenance 边与自动 wikilink 边仍未完全隔离**：`links.is_generated` 字段已存在，但 `put_page()` 刷新正文 wikilinks 时还没有只删除 generated links。后续需要把自动抽取边标记为 `is_generated=1`，避免页面重写清掉显式研究证据链。
+1. **旧 evidence context 无 chunk ID 前缀**：Commit 6 之前通过 `--from-chunk` 存储的 context 没有 `[chunk:ID]` 前缀，新增的才有。
 
-2. **旧 evidence context 无 chunk ID 前缀**：Commit 6 之前通过 `--from-chunk` 存储的 context 没有 `[chunk:ID]` 前缀，新增的才有。
+2. **Dream cycle 仍是 hardcoded housekeeping 流程**：自动维护（lint→embed→extract→synthesize）仍在 engine 内硬编码；已停止写回 LLM timeline events，但还不是 `plan.md` 中规划的 TOML-configurable Pipeline profile。
 
-3. **Dream cycle 仍是 hardcoded housekeeping 流程**：自动维护（lint→embed→extract→synthesize）仍在 engine 内硬编码；已停止写回 LLM timeline events，但还不是 `plan.md` 中规划的 TOML-configurable Pipeline profile。
+3. **研究过程账本模型仍是首版**：`research_run`、输入、artifact、finding、validation_report、action_item 的 Engine/MCP API 已实现，但 `run_kind` 还只是默认 `custom`，尚未提供显式参数和按 run_kind 分组的 pipeline/validator。
 
-4. **研究过程账本模型仍是首版**：`research_run`、输入、artifact、finding、validation_report、action_item 的 Engine/MCP API 已实现，但 `run_kind` 还只是默认 `custom`，尚未提供显式参数和按 run_kind 分组的 pipeline/validator。
+4. **结果核查层仍不完整**：已有基础 validator framework、research_run validators、`validation_report` / `action_item` 落点和 validator timeline 审计；citation / literature-review / brief validators 尚未完整回迁。
 
-5. **结果核查层仍不完整**：已有基础 validator framework、research_run validators、`validation_report` / `action_item` 落点和 validator timeline 审计；citation / literature-review / brief validators 尚未完整回迁。
+5. **缺少期刊引文库能力**：尚未实现 `citation_record`、`literature_corpus`、引文去重、定期简报、热点分析报告和用户推送流程。
 
-6. **缺少期刊引文库能力**：尚未实现 `citation_record`、`literature_corpus`、引文去重、定期简报、热点分析报告和用户推送流程。
+6. **schema 治理仍是轻量版**：已实现 `PageType` / `EdgeType`、轻量 frontmatter 校验、`schema_version` 与 schema 文件约定；尚未接入 `jsonschema` crate 做完整 runtime validation。
 
-7. **schema 治理仍是轻量版**：已实现 `PageType` / `EdgeType`、轻量 frontmatter 校验、`schema_version` 与 schema 文件约定；尚未接入 `jsonschema` crate 做完整 runtime validation。
+7. **timeline 仍是字符串字段**：当前以 String 存储 JSON timeline 数组并兼容旧文本；尚未把 `Page.timeline` 类型全面迁移为 `Vec<TimelineEntry>`。Markdown `---` 分隔符也仍有普通水平线歧义。
 
-8. **timeline 仍是字符串字段**：当前以 String 存储 JSON timeline 数组并兼容旧文本；尚未把 `Page.timeline` 类型全面迁移为 `Vec<TimelineEntry>`。Markdown `---` 分隔符也仍有普通水平线歧义。
+8. **MCP HTTP 仍无内建认证**：HTTP server 已默认限制 loopback，远程绑定必须显式 `--allow-remote`；长期远程服务仍应补充 token/auth 或放在可信反向代理后。
 
-9. **MCP HTTP 暴露面仍需收紧**：HTTP server 仍可绑定非 loopback 地址，尚未加入认证或显式 `--allow-remote` 防护。
-
-10. **缺少 Swiftide 流程层**：尚未实现可选 `rbrain-agent` crate；当前 rbrain 只提供 CLI/MCP/Engine 能力。
+9. **缺少 Swiftide 流程层**：尚未实现可选 `rbrain-agent` crate；当前 rbrain 只提供 CLI/MCP/Engine 能力。
 
 ---
 
@@ -576,9 +625,7 @@ Python / R / DuckDB / 浏览器 = 具体计算和外部操作
 
 ## 下一步（按优先级）
 
-1. 修复 links generated/manual 隔离：`put_page()` 只刷新 `is_generated=1` 的自动边，显式 provenance 边永不被正文重写清理。
-2. 收紧 MCP HTTP：默认只允许 loopback，远程绑定必须显式 `--allow-remote`，并评估 token/auth。
-3. M3 收尾：按 `run_kind` 分组 validators，继续回迁 citation / literature-review validators。
-4. M4 回迁 PipelineRunner，新增 `rbrain pipeline run`，`dream --profile` 保留为别名。
-5. M5 建立期刊引文库独立路径：`citations_query`、CSV/JSON 导入、dedupe、brief/hotspot 生成。
-6. M6 做 Swiftide 0.5-1 天 spike，再决定 `rbrain-agent` 是否基于 Swiftide；失败则走自实现兜底。
+1. M3 收尾：按 `run_kind` 分组 validators，继续回迁 citation / literature-review validators。
+2. M4 回迁 PipelineRunner，新增 `rbrain pipeline run`，`dream --profile` 保留为别名。
+3. M5 建立期刊引文库独立路径：`citations_query`、CSV/JSON 导入、dedupe、brief/hotspot 生成。
+4. M6 做 Swiftide 0.5-1 天 spike，再决定 `rbrain-agent` 是否基于 Swiftide；失败则走自实现兜底。

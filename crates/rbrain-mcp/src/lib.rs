@@ -1110,4 +1110,4 @@ pub async fn run_stdio_server(engine: Engine) -> anyhow::Result<()> {
 }
 
 pub mod http;
-pub use http::run_http_server;
+pub use http::{run_http_server, run_http_server_with_options};

@@ -349,6 +349,74 @@ async fn test_timeline_links_do_not_create_graph_edges() {
 }
 
 #[tokio::test]
+async fn test_put_page_refreshes_generated_links_without_deleting_explicit_links() {
+    let tb = TestBrain::new().await;
+    let engine = open_mock_engine(&tb).await;
+
+    for slug in ["manual-target", "old-auto-target", "new-auto-target"] {
+        engine
+            .put_page(Page::new(
+                slug.to_string(),
+                "note".to_string(),
+                format!("{slug} content."),
+            ))
+            .await
+            .expect("put target");
+    }
+
+    engine
+        .put_page(Page::new(
+            "link-source".to_string(),
+            "note".to_string(),
+            "Initial wikilink to [[old-auto-target]].".to_string(),
+        ))
+        .await
+        .expect("put initial source");
+    engine
+        .add_link(
+            "link-source",
+            "manual-target",
+            "supports",
+            Some("explicit provenance evidence"),
+            None,
+        )
+        .await
+        .expect("add explicit link");
+
+    engine
+        .put_page(Page::new(
+            "link-source".to_string(),
+            "note".to_string(),
+            "Updated wikilink to [[new-auto-target]].".to_string(),
+        ))
+        .await
+        .expect("update source");
+
+    let outlinks = engine.outlinks("link-source").await.expect("outlinks");
+    assert!(
+        outlinks
+            .iter()
+            .any(|link| link.target_slug == "manual-target" && link.edge_type == "supports"),
+        "explicit provenance links must survive page rewrites: {:?}",
+        outlinks
+    );
+    assert!(
+        outlinks
+            .iter()
+            .any(|link| link.target_slug == "new-auto-target" && link.edge_type == "mentions"),
+        "new generated wikilink should be present: {:?}",
+        outlinks
+    );
+    assert!(
+        !outlinks
+            .iter()
+            .any(|link| link.target_slug == "old-auto-target"),
+        "stale generated wikilink should be removed: {:?}",
+        outlinks
+    );
+}
+
+#[tokio::test]
 async fn test_tag_filter_matches_exact_json_tag() {
     let tb = TestBrain::new().await;
     let engine = open_mock_engine(&tb).await;

@@ -306,6 +306,11 @@ enum ServeAction {
     Mcp {
         #[arg(long)]
         http: Option<String>,
+        #[arg(
+            long,
+            help = "Allow MCP HTTP server to bind non-loopback addresses. Requires explicit trust boundary."
+        )]
+        allow_remote: bool,
     },
     Supervisor {
         #[arg(long, default_value = "1")]
@@ -1269,12 +1274,13 @@ async fn main() -> anyhow::Result<()> {
             let config = load_config!();
 
             match action {
-                ServeAction::Mcp { http } => {
+                ServeAction::Mcp { http, allow_remote } => {
                     // MCP server gets full search capability so brain_query/brain_search work
                     let engine = init_engine_with_search(config.clone(), mock_embed).await?;
                     if let Some(addr) = http {
                         eprintln!("Starting MCP HTTP server on {}", addr);
-                        rbrain_mcp::run_http_server(engine, &addr).await?;
+                        rbrain_mcp::run_http_server_with_options(engine, &addr, allow_remote)
+                            .await?;
                     } else {
                         eprintln!("Starting MCP stdio server");
                         rbrain_mcp::run_stdio_server(engine).await?;

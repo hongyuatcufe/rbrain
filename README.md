@@ -195,10 +195,12 @@ rbrain 通过 Model Context Protocol 将所有操作暴露给 Claude Code 等 MC
 ```bash
 rbrain serve mcp                  # stdio mode (for Claude Code) / stdio 模式
 rbrain serve mcp --http 127.0.0.1:3456  # local HTTP mode / 本地 HTTP 模式
+rbrain serve mcp --http 0.0.0.0:3456 --allow-remote  # explicit remote bind / 显式远程绑定
 ```
 
 HTTP mode exposes mutation tools without authentication and therefore only accepts loopback
-addresses (`127.0.0.1`, `[::1]`, or `localhost`). Do not expose it directly to a network.
+addresses (`127.0.0.1`, `[::1]`, or `localhost`) by default. Use `--allow-remote` only behind
+a trusted boundary such as a local tunnel, firewall, or reverse proxy with authentication.
 
 ### MCP Tools / MCP 工具列表
 
